@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Zak Noble-Clarke
+
+[wrap-git]
+url = https://github.com/MXEmulation/mx-guest-linux-common.git
+revision = d0ce5528514c7cd88ed2816fdcbc6f854092e38e
+depth = 1
