@@ -1,6 +1,7 @@
 # Copyright © 2017 Dylan Baker
 # Copyright © 2017-2018 Intel Corporation
 # SPDX-License-Identifier: MIT
+# Modified by Zak Noble-Clarke for MX, 2026-09-27: build the mxgpu Gallium driver.
 
 sym_config = configuration_data()
 
@@ -53,6 +54,11 @@ if with_gallium_softpipe
 else
   driver_softpipe = declare_dependency()
 endif
+if with_gallium_mxgpu
+  subdir('drivers/mxgpu')
+else
+  driver_mxgpu = declare_dependency()
+endif
 if with_any_llvmpipe
   subdir('drivers/llvmpipe')
 else
@@ -66,6 +72,8 @@ elif with_any_llvmpipe
   driver_swrast = driver_llvmpipe
 elif with_gallium_softpipe
   driver_swrast = driver_softpipe
+elif with_gallium_mxgpu
+  driver_swrast = driver_mxgpu
 else
   driver_swrast = declare_dependency()
 endif

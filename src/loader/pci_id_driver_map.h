@@ -1,3 +1,4 @@
+/* Modified by Zak Noble-Clarke for MX, 2026-10-05: select the MXGPU DRM loader for its PCI vendor. */
 #ifndef _PCI_ID_DRIVER_MAP_H_
 #define _PCI_ID_DRIVER_MAP_H_
 
@@ -65,6 +66,7 @@ static const struct {
    { 0x10de, "zink", NULL, -1, nouveau_zink_predicate },
    { 0x1af4, "virtio_gpu", virtio_gpu_chip_ids, ARRAY_SIZE(virtio_gpu_chip_ids) },
    { 0x15ad, "vmwgfx", vmwgfx_chip_ids, ARRAY_SIZE(vmwgfx_chip_ids) },
+   { 0x4d58, "mxgpu", NULL, -1 },
 };
 
 #endif /* _PCI_ID_DRIVER_MAP_H_ */

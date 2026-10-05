@@ -1,4 +1,6 @@
+# Modified by Zak Noble-Clarke for MX, 2026-10-05: retain the MX dependency build overlays.
 *
 !*.wrap
+!packagefiles/
 !packagefiles/**
 !.gitignore

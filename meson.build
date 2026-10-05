@@ -1,5 +1,7 @@
 # Copyright © 2017-2020 Intel Corporation
 # SPDX-License-Identifier: MIT
+# Modified by Zak Noble-Clarke for MX, 2026-09-27: select the MXGPU Gallium driver and Vulkan ICD.
+# Modified by Zak Noble-Clarke for MX, 2026-10-05: select MXGPU drivers and consume pinned public protocol dependencies.
 
 project(
   'mesa',
@@ -235,6 +237,7 @@ with_gallium_d3d12 = gallium_drivers.contains('d3d12')
 with_gallium_asahi = gallium_drivers.contains('asahi')
 with_gallium_rocket = gallium_drivers.contains('rocket')
 with_gallium_ethosu = gallium_drivers.contains('ethosu')
+with_gallium_mxgpu = gallium_drivers.contains('mxgpu')
 foreach gallium_driver : gallium_drivers
   pre_args += '-DHAVE_@0@'.format(gallium_driver.to_upper())
 endforeach
@@ -250,7 +253,7 @@ with_llvm = with_llvm \
   .enable_if(with_gallium_radeonsi and amd_with_llvm, error_message : 'RadeonSI Gallium driver configured to require LLVM')
 
 # compatibility for "swrast" as an internal-ish driver name
-with_gallium_swrast = with_gallium_softpipe or with_gallium_llvmpipe
+with_gallium_swrast = with_gallium_softpipe or with_gallium_llvmpipe or with_gallium_mxgpu
 if with_gallium_swrast
   pre_args += '-DHAVE_SWRAST'
 endif
@@ -314,6 +317,7 @@ with_nouveau_vk = _vulkan_drivers.contains('nouveau')
 with_asahi_vk = _vulkan_drivers.contains('asahi')
 with_gfxstream_vk = _vulkan_drivers.contains('gfxstream')
 with_kosmickrisp_vk = _vulkan_drivers.contains('kosmickrisp')
+with_mxgpu_vk = _vulkan_drivers.contains('mxgpu')
 with_any_vk = _vulkan_drivers.length() != 0
 
 with_llvm = with_llvm \
@@ -2543,6 +2547,14 @@ if vulkan_manifest_per_architecture
   vulkan_manifest_suffix = '@0@.json'.format(host_machine.cpu())
 else
   vulkan_manifest_suffix = 'json'
+endif
+
+if with_gallium_mxgpu or with_mxgpu_vk
+  if host_machine.system() != 'linux'
+    error('MXGPU requires the Linux DRM interface')
+  endif
+  mxgpu_core_dep = subproject('mx-guest-core').get_variable('mxgpu_core_dep')
+  mxgpu_linux_common_dep = subproject('mx-guest-linux-common').get_variable('mxgpu_linux_common_dep')
 endif
 
 subdir('include')

@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Zak Noble-Clarke
+
+version = 1
+
+[[annotations]]
+path = "src/mxgpu/mxgpu_icd.json"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Zak Noble-Clarke"
+SPDX-License-Identifier = "MIT"

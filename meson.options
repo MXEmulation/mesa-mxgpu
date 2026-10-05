@@ -1,5 +1,13 @@
 # Copyright © 2017-2019 Intel Corporation
 # SPDX-License-Identifier: MIT
+# Modified by Zak Noble-Clarke for MX, 2026-10-05: select MXGPU graphics drivers and their validation programs.
+
+option(
+  'mxgpu-tests',
+  type : 'boolean',
+  value : false,
+  description : 'Build MXGPU rendering and continuity validation programs',
+)
 
 option(
   'split-debug',
@@ -86,7 +94,7 @@ option(
   choices : [
     'all', 'auto',
     'asahi', 'crocus', 'd3d12', 'ethosu', 'etnaviv', 'freedreno', 'i915', 'iris',
-    'lima', 'llvmpipe', 'nouveau', 'panfrost', 'r300', 'r600', 'radeonsi',
+    'lima', 'llvmpipe', 'mxgpu', 'nouveau', 'panfrost', 'r300', 'r600', 'radeonsi',
     'rocket', 'softpipe', 'svga', 'tegra', 'v3d', 'vc4', 'virgl', 'zink',
   ],
   description : 'List of gallium drivers to build. If this is set to auto ' +
@@ -209,7 +217,7 @@ option(
   choices : ['auto', 'amd', 'broadcom', 'freedreno', 'intel', 'intel_hasvk',
              'panfrost', 'swrast', 'virtio', 'imagination',
              'microsoft-experimental', 'nouveau', 'asahi', 'gfxstream',
-             'kosmickrisp', 'all'],
+             'kosmickrisp', 'mxgpu', 'all'],
   description : 'List of vulkan drivers to build. If this is set to auto ' +
                 'all drivers applicable to the target OS/architecture ' +
                 'will be built'

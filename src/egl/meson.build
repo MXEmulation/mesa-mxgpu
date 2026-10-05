@@ -1,5 +1,7 @@
 # Copyright © 2017-2019 Intel Corporation
 # SPDX-License-Identifier: MIT
+# Modified by Zak Noble-Clarke for MX, 2026-09-28: record $ORIGIN as the RUNPATH for libgallium and libgbm.
+# Modified by Zak Noble-Clarke for MX, 2026-10-05: retain relative runtime library lookup on Linux.
 
 inc_egl = include_directories('.', 'main')
 
@@ -8,8 +10,15 @@ cpp_args_for_egl = []
 link_args_for_egl = []
 link_deps_for_egl = []
 link_for_egl = []
+egl_shared_link_args = []
+egl_link_depends = []
 if with_dri
-  link_for_egl += libgallium_dri
+  if host_machine.system() == 'linux'
+    egl_shared_link_args += [libgallium_dri.full_path()]
+    egl_link_depends += [libgallium_dri]
+  else
+    link_for_egl += libgallium_dri
+  endif
 endif
 if with_platform_windows
   link_for_egl += libgallium_wgl
@@ -103,6 +112,9 @@ if with_dri
     files_egl += files('drivers/dri2/platform_drm.c')
     incs_for_egl += [include_directories('../gbm/backends/dri')]
     deps_for_egl += [dep_libdrm, dep_gbm]
+    if not get_option('libgbm-external') and host_machine.system() == 'linux'
+      egl_link_depends += [libgbm]
+    endif
   endif
   if with_platform_wayland
     deps_for_egl += [dep_wayland_client, dep_wayland_server, dep_wayland_egl_headers]
@@ -200,8 +212,10 @@ libegl = shared_library(
   gnu_symbol_visibility : 'hidden',
   include_directories : incs_for_egl,
   link_with : [link_for_egl],
-  link_args : [ld_args_bsymbolic, ld_args_gc_sections, link_args_for_egl],
-  link_depends : [link_deps_for_egl],
+  link_args : [ld_args_bsymbolic, ld_args_gc_sections, link_args_for_egl, egl_shared_link_args],
+  link_depends : [link_deps_for_egl, egl_link_depends],
+  build_rpath : host_machine.system() == 'linux' ? '$ORIGIN' : '',
+  install_rpath : host_machine.system() == 'linux' ? '$ORIGIN' : '',
   dependencies : [deps_for_egl, dep_dl, dep_libdrm, dep_clock, dep_thread, idep_mesautil],
   install : true,
   version : egl_lib_version,

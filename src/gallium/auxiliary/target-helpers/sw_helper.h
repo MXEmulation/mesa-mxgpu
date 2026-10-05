@@ -1,3 +1,4 @@
+/* Modified by Zak Noble-Clarke for MX, 2026-09-27: create the mxgpu screen. */
 
 #ifndef SW_HELPER_H
 #define SW_HELPER_H
@@ -22,6 +23,10 @@
 
 #ifdef GALLIUM_SOFTPIPE
 #include "softpipe/sp_public.h"
+#endif
+
+#ifdef GALLIUM_MXGPU
+#include "mxgpu/mxgpu_public.h"
 #endif
 
 #ifdef GALLIUM_LLVMPIPE
@@ -54,6 +59,11 @@ sw_screen_create_named(struct sw_winsys *winsys, const struct pipe_screen_config
 #if defined(GALLIUM_SOFTPIPE)
    if (screen == NULL && strcmp(driver, "softpipe") == 0)
       screen = softpipe_create_screen(winsys);
+#endif
+
+#ifdef GALLIUM_MXGPU
+   if (screen == NULL && strcmp(driver, "mxgpu") == 0)
+      screen = mxgpu_create_screen(winsys);
 #endif
 
 #if defined(GALLIUM_ZINK)

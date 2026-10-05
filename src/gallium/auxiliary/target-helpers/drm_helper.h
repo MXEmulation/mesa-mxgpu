@@ -1,3 +1,4 @@
+/* Modified by Zak Noble-Clarke for MX, 2026-09-27: register the mxgpu DRM screen. */
 #ifndef DRM_HELPER_H
 #define DRM_HELPER_H
 
@@ -462,6 +463,24 @@ DRM_DRIVER_DESCRIPTOR(rocket, NULL, 0)
 #else
 DRM_DRIVER_DESCRIPTOR_STUB(rknpu)
 DRM_DRIVER_DESCRIPTOR_STUB(rocket)
+#endif
+
+#ifdef GALLIUM_MXGPU
+#include "mxgpu/mxgpu_public.h"
+
+static struct pipe_screen *
+pipe_mxgpu_create_screen(int fd, const struct pipe_screen_config *config)
+{
+   struct pipe_screen *screen;
+
+   (void)config;
+   screen = mxgpu_drm_screen_create(fd);
+   return screen ? debug_screen_wrap(screen) : NULL;
+}
+
+DRM_DRIVER_DESCRIPTOR(mxgpu, NULL, 0)
+#else
+DRM_DRIVER_DESCRIPTOR_STUB(mxgpu)
 #endif
 
 #ifdef GALLIUM_ETHOSU

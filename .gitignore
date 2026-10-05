@@ -1,3 +1,4 @@
+# Modified by Zak Noble-Clarke for MX, 2026-10-05: ignore local MXGPU executable build outputs.
 .cache
 .vscode*
 *.kdev4
@@ -7,3 +8,10 @@
 /build
 .venv/
 *.mda.tar
+/src/mxgpu/gl_scene
+/src/mxgpu/gl_stress
+/src/mxgpu/vk_scene
+/src/mxgpu/vk_stress
+/src/mxgpu/vk_system
+/src/mxgpu/egl_client
+/src/mxgpu/vk_client

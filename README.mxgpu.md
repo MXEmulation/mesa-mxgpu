@@ -12,11 +12,24 @@ MX's Mesa fork for MXGPU in Linux guests.
 
 The upstream source baseline is Mesa commit `503e8fe6077474c912876c8298fc7b839d90ceba`. Mesa's [README.rst](README.rst) describes the upstream project.
 
-This revision contains fork documentation and dependency wraps. The MXGPU driver and Vulkan ICD are not implemented.
+## Capabilities
+
+The tested rendering paths support OpenGL 2.1 and OpenGL ES 2.0, including textures, indexed draws and instancing. The Vulkan ICD supports shader translation, rendering and readback for a graphics subset and is not conformant. OpenGL ES 3, WebGL 2 and WebGPU support are incomplete.
+
+## Build and tests
+
+```sh
+meson setup build -Dgallium-drivers=mxgpu -Dvulkan-drivers=mxgpu -Dplatforms=x11,wayland -Dllvm=disabled
+meson compile -C build
+```
+
+Meson fetches the pinned dependencies and uses the overlays in [subprojects/packagefiles/](subprojects/packagefiles/).
+
+Enable `-Dmxgpu-tests=true` for the EGL/GLES and Vulkan rendering fixtures under [src/mxgpu/](src/mxgpu/). They require EGL/GLES and Vulkan development packages plus `glslangValidator`. Running them requires a compatible loaded `mxgpu` DRM driver and selected MXGPU libraries. The fixtures check actual rendering, pixels and error recovery.
 
 ## Dependencies
 
-The exact public [Core](https://github.com/MXEmulation/mx-guest-core) and [Linux Common](https://github.com/MXEmulation/mx-guest-linux-common) commits are pinned in [subprojects/mx-guest-core.wrap](subprojects/mx-guest-core.wrap) and [subprojects/mx-guest-linux-common.wrap](subprojects/mx-guest-linux-common.wrap). Those dependency revisions contain repository metadata only; no codecs or DRM ioctl ABI implementation is present.
+The exact public [Core](https://github.com/MXEmulation/mx-guest-core) and [Linux Common](https://github.com/MXEmulation/mx-guest-linux-common) commits are pinned in [subprojects/mx-guest-core.wrap](subprojects/mx-guest-core.wrap) and [subprojects/mx-guest-linux-common.wrap](subprojects/mx-guest-linux-common.wrap). They supply the protocol constants, codecs and DRM ioctl ABI.
 
 ## Licences and contributions
 

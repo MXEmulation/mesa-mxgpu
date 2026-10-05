@@ -1,5 +1,6 @@
 # Copyright © 2017 Intel Corporation
 # SPDX-License-Identifier: MIT
+# Modified by Zak Noble-Clarke for MX, 2026-09-27: build the mxgpu Vulkan ICD.
 
 mesa_python_path = [
   join_paths(dir_source_root, 'src/util/perf/'),
@@ -159,6 +160,9 @@ endif
 
 if with_egl
   subdir('egl')
+endif
+if with_mxgpu_vk or (with_gallium_mxgpu and get_option('mxgpu-tests'))
+  subdir('mxgpu')
 endif
 if with_gallium
   if with_glx == 'dri' or with_platform_x11

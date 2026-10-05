@@ -1,5 +1,7 @@
 # Copyright © 2017 Intel Corporation
 # SPDX-License-Identifier: MIT
+# Modified by Zak Noble-Clarke for MX, 2026-09-28: link libgbm by its output path for relative runtime library lookup.
+# Modified by Zak Noble-Clarke for MX, 2026-10-05: retain relative runtime library lookup on Linux.
 
 inc_gbm = include_directories('.', 'main', 'backends/dri')
 
@@ -64,7 +66,14 @@ if with_symbols_check
   )
 endif
 
-dep_gbm = declare_dependency(
-  link_with : libgbm,
-  include_directories : inc_gbm,
-)
+if host_machine.system() == 'linux'
+  dep_gbm = declare_dependency(
+    link_args : [libgbm.full_path()],
+    include_directories : inc_gbm,
+  )
+else
+  dep_gbm = declare_dependency(
+    link_with : libgbm,
+    include_directories : inc_gbm,
+  )
+endif

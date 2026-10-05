@@ -29,6 +29,7 @@
  *    Benjamin Franzke <benjaminfranzke@googlemail.com>
  *
  **************************************************************************/
+/* Modified by Zak Noble-Clarke for MX, 2026-09-27: load the mxgpu DRM driver. */
 
 #include <fcntl.h>
 #include <stdio.h>
@@ -86,6 +87,7 @@ static const struct drm_driver_descriptor *driver_descriptors[] = {
    &etnaviv_driver_descriptor,
    &rocket_driver_descriptor,
    &ethosu_driver_descriptor,
+   &mxgpu_driver_descriptor,
    &tegra_driver_descriptor,
    &lima_driver_descriptor,
    &zink_driver_descriptor,

@@ -1,6 +1,7 @@
 # Copyright © 2017 Dylan Baker
 # Copyright © 2018 Intel Corporation
 # SPDX-License-Identifier: MIT
+# Modified by Zak Noble-Clarke for MX, 2026-10-05: link the MXGPU Gallium screen.
 
 # TODO: support non-static targets
 # Static targets are always enabled in autotools (unless you modify
@@ -61,7 +62,7 @@ libgallium_dri = shared_library(
     driver_kmsro, driver_v3d, driver_vc4, driver_freedreno, driver_etnaviv,
     driver_tegra, driver_i915, driver_svga, driver_virgl,
     driver_panfrost, driver_iris, driver_lima, driver_zink, driver_d3d12,
-    driver_asahi, driver_crocus, driver_rocket, driver_ethosu
+    driver_asahi, driver_crocus, driver_rocket, driver_ethosu, driver_mxgpu
   ],
   install : true,
   name_suffix : libname_suffix,

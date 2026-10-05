@@ -1,5 +1,7 @@
 # Copyright © 2017-2019 Intel Corporation
 # SPDX-License-Identifier: MIT
+# Modified by Zak Noble-Clarke for MX, 2026-09-28: record $ORIGIN as the RUNPATH for libgallium.
+# Modified by Zak Noble-Clarke for MX, 2026-10-05: retain relative runtime library lookup on Linux.
 
 inc_glx = include_directories('.')
 
@@ -133,6 +135,8 @@ libgl = shared_library(
   [],
   link_whole : [libglx, libgl_link],
   link_args : [ld_args_bsymbolic, ld_args_gc_sections, extra_ld_args_libgl],
+  build_rpath : host_machine.system() == 'linux' ? '$ORIGIN' : '',
+  install_rpath : host_machine.system() == 'linux' ? '$ORIGIN' : '',
   dependencies : [
     dep_libdrm, dep_dl, dep_m, dep_thread, dep_x11, dep_xcb_glx, dep_xcb,
     dep_x11_xcb, dep_xext, dep_xxf86vm, dep_xcb_shm, extra_deps_libgl,

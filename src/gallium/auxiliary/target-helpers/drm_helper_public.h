@@ -1,3 +1,4 @@
+/* Modified by Zak Noble-Clarke for MX, 2026-09-27: declare the mxgpu DRM descriptor. */
 #ifndef _DRM_HELPER_PUBLIC_H
 #define _DRM_HELPER_PUBLIC_H
 
@@ -24,6 +25,7 @@ extern const struct drm_driver_descriptor etnaviv_driver_descriptor;
 extern const struct drm_driver_descriptor rknpu_driver_descriptor;
 extern const struct drm_driver_descriptor rocket_driver_descriptor;
 extern const struct drm_driver_descriptor ethosu_driver_descriptor;
+extern const struct drm_driver_descriptor mxgpu_driver_descriptor;
 extern const struct drm_driver_descriptor tegra_driver_descriptor;
 extern const struct drm_driver_descriptor lima_driver_descriptor;
 extern const struct drm_driver_descriptor zink_driver_descriptor;

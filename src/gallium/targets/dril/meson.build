@@ -1,5 +1,8 @@
 # Copyright © 2017 Dylan Baker
 # Copyright © 2018 Intel Corporation
+# Modified by Zak Noble-Clarke for MX, 2026-09-27: link the MXGPU screen into swrast.
+# Modified by Zak Noble-Clarke for MX, 2026-09-28: record $ORIGIN/.. as the RUNPATH for libgbm.
+# Modified by Zak Noble-Clarke for MX, 2026-10-05: link the MXGPU screen and retain relative runtime library lookup on Linux.
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -38,6 +41,9 @@ if with_ld_dynamic_list
   dril_ld_args += ['-Wl,--dynamic-list', join_paths(meson.current_source_dir(), '../dri.dyn')]
   dril_link_depends += files('../dri.dyn')
 endif
+if with_gbm and not get_option('libgbm-external') and host_machine.system() == 'linux'
+  dril_link_depends += [libgbm]
+endif
 
 dril_dri = shared_library(
   'dril_dri',
@@ -49,12 +55,15 @@ dril_dri = shared_library(
   gnu_symbol_visibility : 'hidden',
   link_args : [ld_args_build_id, ld_args_gc_sections, dril_ld_args],
   link_depends : dril_link_depends,
+  build_rpath : host_machine.system() == 'linux' ? '$ORIGIN/..' : '',
+  install_rpath : host_machine.system() == 'linux' ? '$ORIGIN/..' : '',
   link_with : [
     libgallium,
   ],
   dependencies : [
     idep_mesautil,
     dep_gbm,
+    driver_mxgpu,
   ],
   # Will be deleted during installation, see install_megadrivers.py
   install : true,
@@ -105,6 +114,7 @@ foreach d : [[with_gallium_kmsro, [
              [with_gallium_nouveau, ['nouveau']],
              [with_gallium_freedreno, ['msm', 'kgsl']],
              [with_gallium_swrast, ['swrast']],
+             [with_gallium_mxgpu, ['mxgpu']],
              [with_gallium_swrast and with_gallium_drisw_kms, ['kms_swrast']],
              [with_gallium_v3d, ['v3d']],
              [with_gallium_vc4, ['vc4']],

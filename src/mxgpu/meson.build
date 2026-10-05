@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Zak Noble-Clarke
+
+mxgpu_protocol_deps = [mxgpu_core_dep, mxgpu_linux_common_dep]
+if with_mxgpu_vk
+  mxgpu_vk_platform_deps = []
+  mxgpu_vk_platform_args = []
+  if with_platform_wayland
+    mxgpu_vk_platform_deps += dep_wayland_client
+    mxgpu_vk_platform_args += '-DVK_USE_PLATFORM_WAYLAND_KHR'
+  endif
+  mxgpu_vk_deps = [idep_nir, idep_vtn, idep_mesautil, idep_vulkan_util] + mxgpu_protocol_deps + mxgpu_vk_platform_deps
+  mxgpu_vk_impl = static_library(
+    'mxgpu_vk_impl',
+    files('mxgpu_vk.c', 'mxgpu_compiler.c', 'mxgpu_scene.c', '../gallium/drivers/mxgpu/mxgpu_link.c'),
+    include_directories : [inc_include, inc_src, include_directories('.')],
+    dependencies : mxgpu_vk_deps,
+    c_args : mxgpu_vk_platform_args,
+    gnu_symbol_visibility : 'hidden',
+    pic : true,
+  )
+  libvulkan_mxgpu = shared_library(
+    'vulkan_mxgpu',
+    link_whole : mxgpu_vk_impl,
+    dependencies : mxgpu_vk_deps,
+    gnu_symbol_visibility : 'hidden',
+    install : true,
+  )
+  install_data(
+    'mxgpu_icd.json',
+    install_dir : join_paths(get_option('datadir'), 'vulkan/icd.d'),
+  )
+endif
+
+if get_option('mxgpu-tests')
+  if with_gallium_mxgpu
+    mxgpu_egl_deps = [dependency('egl'), dependency('glesv2')]
+    foreach validation : ['gl_scene', 'gl_stress']
+      executable(validation, files(validation + '.c', 'egl_client.c'),
+                 dependencies : mxgpu_egl_deps)
+    endforeach
+    executable('egl_client', 'egl_client.c', c_args : '-DMXGPU_EGL_CLIENT_MAIN',
+               dependencies : mxgpu_egl_deps)
+  endif
+  if with_mxgpu_vk
+    glslang = find_program('glslangValidator', required : true)
+    scene_shaders = []
+    foreach shader : [
+      ['scene.vert', 'scene-vert.h', 'scene_vertex'],
+      ['scene.frag', 'scene-frag.h', 'scene_fragment'],
+      ['scene-zero.frag', 'scene-zero-frag.h', 'scene_zero_fragment'],
+    ]
+      scene_shaders += custom_target(
+        shader[1], input : shader[0], output : shader[1],
+        command : [glslang, '-V', '--target-env', 'vulkan1.0', '--vn', shader[2], '-o', '@OUTPUT@', '@INPUT@'],
+      )
+    endforeach
+    foreach validation : ['vk_scene', 'vk_stress']
+      executable(validation, files(validation + '.c', 'vk_frame.c') + scene_shaders,
+                 include_directories : include_directories('.'),
+                 link_with : mxgpu_vk_impl, dependencies : mxgpu_vk_deps)
+    endforeach
+    vulkan_loader = dependency('vulkan')
+    foreach validation : ['vk_client', 'vk_system']
+      executable(validation, files(validation + '.c', 'vk_frame.c') + scene_shaders,
+                 include_directories : include_directories('.'),
+                 dependencies : [vulkan_loader] + mxgpu_protocol_deps + (validation == 'vk_client' ? [dep_dl] : []))
+    endforeach
+  endif
+endif
