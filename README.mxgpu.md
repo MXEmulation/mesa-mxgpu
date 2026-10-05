@@ -16,6 +16,8 @@ The upstream source baseline is Mesa commit `503e8fe6077474c912876c8298fc7b839d9
 
 The tested rendering paths support OpenGL 2.1 and OpenGL ES 2.0, including textures, indexed draws and instancing. The Vulkan ICD supports shader translation, rendering and readback for a graphics subset and is not conformant. OpenGL ES 3, WebGL 2 and WebGPU support are incomplete.
 
+`GL_ANGLE_instanced_arrays` requires native instancing and attribute divisors. Its EGL fixture checks indexed widths, divisors, pixels and error recovery. Firefox 157 renders the browser fixture's valid scenes; its disabled active attribute check returns no error where `INVALID_OPERATION` is expected, so that check remains failed.
+
 ## Build and tests
 
 ```sh

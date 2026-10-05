@@ -1,0 +1,65 @@
+<!-- SPDX-License-Identifier: MIT -->
+<!-- SPDX-FileCopyrightText: 2026 Zak Noble-Clarke -->
+<!doctype html>
+<meta charset="utf-8"><title>MXGPU WebGL instancing checks</title>
+<canvas id="scene" width="32" height="16"></canvas><pre id="result">Running actual instanced draws</pre>
+<script>
+window.probeResult=null;
+const result={checks:[]};
+try {
+ const gl=document.getElementById('scene').getContext('webgl',{antialias:false,preserveDrawingBuffer:true});
+ if(!gl)throw Error('No WebGL context');
+ const ext=gl.getExtension('ANGLE_instanced_arrays');result.extension=!!ext;
+ if(!ext)throw Error('No ANGLE_instanced_arrays extension');
+ const debug=gl.getExtension('WEBGL_debug_renderer_info');result.vendor=debug?gl.getParameter(debug.UNMASKED_VENDOR_WEBGL):gl.getParameter(gl.VENDOR);
+ function shader(type,source){const s=gl.createShader(type);gl.shaderSource(s,source);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw Error(gl.getShaderInfoLog(s));return s;}
+ const program=gl.createProgram();
+ gl.attachShader(program,shader(gl.VERTEX_SHADER,'attribute vec2 position; attribute vec2 offset; attribute vec3 color; varying vec3 paint; void main(){paint=color;gl_Position=vec4(position+offset,0.0,1.0);}'));
+ gl.attachShader(program,shader(gl.FRAGMENT_SHADER,'precision mediump float; varying vec3 paint; void main(){gl_FragColor=vec4(paint,1.0);}'));
+ gl.linkProgram(program);if(!gl.getProgramParameter(program,gl.LINK_STATUS))throw Error(gl.getProgramInfoLog(program));gl.useProgram(program);
+ function attribute(name,components,data,divisor,byteOffset=0){const buffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(data),gl.STATIC_DRAW);const slot=gl.getAttribLocation(program,name);gl.enableVertexAttribArray(slot);gl.vertexAttribPointer(slot,components,gl.FLOAT,false,0,byteOffset);ext.vertexAttribDivisorANGLE(slot,divisor);return slot;}
+ const vertices=[-.45,-.9,.45,-.9,.45,.9,-.45,-.9,.45,.9,-.45,.9];
+ const positions=attribute('position',2,vertices,0);
+ const offsets=attribute('offset',2,[999,999,-.5,0,.5,0],1,8);
+ result.locations={position:positions,offset:offsets,color:gl.getAttribLocation(program,'color')};
+ attribute('color',3,[1,0,0,0,1,0,0,0,1,1,1,1],1);
+ gl.viewport(0,0,32,16);
+ function verify(name,expected){const actual=new Uint8Array(8);gl.readPixels(8,8,1,1,gl.RGBA,gl.UNSIGNED_BYTE,actual.subarray(0,4));gl.readPixels(24,8,1,1,gl.RGBA,gl.UNSIGNED_BYTE,actual.subarray(4));const error=gl.getError();const pass=actual.every((v,i)=>v===expected[i])&&error===gl.NO_ERROR;result.checks.push({name,actual:Array.from(actual),expected,error,pass});if(!pass)throw Error(name+' pixels differ');}
+ gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);ext.drawArraysInstancedANGLE(gl.TRIANGLES,0,6,2);
+ verify('nonindexed divisor1 and attribute offset',[255,0,0,255,0,255,0,255]);
+ const index=gl.createBuffer();gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,index);
+ const variants=[[gl.UNSIGNED_BYTE,Uint8Array],[gl.UNSIGNED_SHORT,Uint16Array]];
+ if(gl.getExtension('OES_element_index_uint'))variants.push([gl.UNSIGNED_INT,Uint32Array]);
+ for(const [type,ArrayType]of variants){gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new ArrayType([0,1,2,3,4,5]),gl.STATIC_DRAW);gl.clear(gl.COLOR_BUFFER_BIT);ext.drawElementsInstancedANGLE(gl.TRIANGLES,6,type,0,2);verify('indexed type'+type,[255,0,0,255,0,255,0,255]);}
+ ext.vertexAttribDivisorANGLE(offsets,2);gl.clear(gl.COLOR_BUFFER_BIT);ext.drawArraysInstancedANGLE(gl.TRIANGLES,0,6,4);
+ verify('divisor2 advances every second instance',[0,255,0,255,255,255,255,255]);
+ gl.clearColor(.25,.5,.75,1);gl.clear(gl.COLOR_BUFFER_BIT);ext.drawArraysInstancedANGLE(gl.TRIANGLES,0,6,0);
+ verify('zero instances preserve clear',[64,128,191,255,64,128,191,255]);
+ function expectError(name,expected){const actual=gl.getError();const pass=actual===expected;result.checks.push({name,actual,expected,pass});}
+ const colors=gl.getAttribLocation(program,'color');
+ ext.vertexAttribDivisorANGLE(positions,1);
+ ext.vertexAttribDivisorANGLE(offsets,1);
+ ext.vertexAttribDivisorANGLE(colors,1);
+ gl.clearColor(0,0,1,1);gl.clear(gl.COLOR_BUFFER_BIT);
+ ext.drawArraysInstancedANGLE(gl.TRIANGLES,0,6,2);
+ expectError('all active arrays instanced',gl.INVALID_OPERATION);
+ ext.drawElementsInstancedANGLE(gl.TRIANGLES,6,gl.UNSIGNED_SHORT,0,2);
+ expectError('indexed all active arrays instanced',gl.INVALID_OPERATION);
+ const inactive=gl.getParameter(gl.MAX_VERTEX_ATTRIBS)-1;
+ if(inactive===positions||inactive===offsets||inactive===colors)throw Error('No unused attribute slot');
+ const unused=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,unused);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(24),gl.STATIC_DRAW);
+ gl.enableVertexAttribArray(inactive);gl.vertexAttribPointer(inactive,4,gl.FLOAT,false,0,0);ext.vertexAttribDivisorANGLE(inactive,0);
+ ext.drawArraysInstancedANGLE(gl.TRIANGLES,0,6,2);
+ expectError('inactive divisor zero does not satisfy requirement',gl.INVALID_OPERATION);
+ gl.disableVertexAttribArray(inactive);ext.vertexAttribDivisorANGLE(positions,0);gl.disableVertexAttribArray(positions);
+ result.disabledArrayState=[positions,offsets,colors].map(index=>({index,enabled:gl.getVertexAttrib(index,gl.VERTEX_ATTRIB_ARRAY_ENABLED),divisor:gl.getVertexAttrib(index,ext.VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE)}));
+ ext.drawArraysInstancedANGLE(gl.TRIANGLES,0,6,2);
+ expectError('disabled divisor zero does not satisfy requirement',gl.INVALID_OPERATION);
+ verify('pixels after error-control draws',[0,0,255,255,0,0,255,255]);
+ gl.enableVertexAttribArray(positions);gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);
+ ext.drawArraysInstancedANGLE(gl.TRIANGLES,0,6,2);
+ verify('valid draw after errors',[255,0,0,255,0,255,0,255]);
+ result.pass=result.checks.every(check=>check.pass);
+}catch(e){result.pass=false;result.exception=String(e);}
+window.probeResult=result;document.getElementById('result').textContent=JSON.stringify(result,null,2);
+</script>

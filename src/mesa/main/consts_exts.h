@@ -23,6 +23,8 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
+/* Modified by Zak Noble-Clarke for MX, 2026-10-05: implement validated ANGLE instanced arrays. */
+
 /**
  * \file consts_exts.h
  * Mesa Constants and GL Extensions data structures.
@@ -45,6 +47,7 @@ struct gl_extensions
 {
    GLboolean dummy;  /* don't remove this! */
    GLboolean dummy_true;  /* Set true by _mesa_init_extensions(). */
+   GLboolean ANGLE_instanced_arrays;
    GLboolean ANGLE_texture_compression_dxt;
    GLboolean ARB_ES2_compatibility;
    GLboolean ARB_ES3_compatibility;

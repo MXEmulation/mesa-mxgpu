@@ -20,6 +20,8 @@
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 # IN THE SOFTWARE.
 
+# Modified by Zak Noble-Clarke for MX, 2026-10-05: register validated ANGLE instanced draw entry points.
+
 import os
 import sys
 
@@ -1666,6 +1668,8 @@ all_functions = [
     "GetnHistogramARB",
     "GetnMinmaxARB",
     "GetnSeparableFilterARB",
+    "DrawArraysInstancedANGLE",
+    "DrawElementsInstancedANGLE",
 ]
 
 offsets = {}

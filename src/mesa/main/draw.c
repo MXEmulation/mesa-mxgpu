@@ -26,6 +26,8 @@
  *
  **************************************************************************/
 
+/* Modified by Zak Noble-Clarke for MX, 2026-10-05: implement validated ANGLE instanced arrays. */
+
 #include <stdio.h>
 #include "arrayobj.h"
 #include "util/glheader.h"
@@ -570,6 +572,20 @@ _mesa_validate_MultiDrawArrays(struct gl_context *ctx, GLenum mode,
       _mesa_error(ctx, error, "glMultiDrawArrays");
 
    return !error;
+}
+
+
+static bool
+validate_angle_instanced_arrays(struct gl_context *ctx, const char *name)
+{
+   const struct gl_vertex_array_object *vao = ctx->Array._DrawVAO;
+   const struct gl_program *program = ctx->VertexProgram._Current;
+   if (program && (vao->Enabled & ~vao->NonZeroDivisorMask &
+                   program->info.inputs_read & VERT_BIT_GENERIC_ALL))
+      return true;
+
+   _mesa_error(ctx, GL_INVALID_OPERATION, "%s(no active divisor-zero array)", name);
+   return false;
 }
 
 
@@ -1402,6 +1418,26 @@ _mesa_DrawArraysInstanced(GLenum mode, GLint start, GLsizei count,
 }
 
 
+void GLAPIENTRY
+_mesa_DrawArraysInstancedANGLE(GLenum mode, GLint first, GLsizei count,
+                               GLsizei numInstances)
+{
+   GET_CURRENT_CONTEXT(ctx);
+   FLUSH_FOR_DRAW(ctx);
+   _mesa_set_varying_vp_inputs(ctx, ctx->VertexProgram._VPModeInputFilter &
+                               ctx->Array._DrawVAO->_EnabledWithMapMode);
+   if (ctx->NewState)
+      _mesa_update_state(ctx);
+
+   if (!_mesa_is_no_error_enabled(ctx) &&
+       (!_mesa_validate_DrawArraysInstanced(ctx, mode, first, count, numInstances) ||
+        !validate_angle_instanced_arrays(ctx, "glDrawArraysInstancedANGLE")))
+      return;
+
+   _mesa_draw_arrays(ctx, mode, first, count, numInstances, 0);
+}
+
+
 /**
  * Called from glDrawArraysInstancedBaseInstance when in immediate mode.
  */
@@ -1852,6 +1888,28 @@ _mesa_DrawElementsInstanced(GLenum mode, GLsizei count, GLenum type,
    _mesa_DrawElementsInstancedBaseVertexBaseInstance(mode, count, type,
                                                      indices, numInstances,
                                                      0, 0);
+}
+
+
+void GLAPIENTRY
+_mesa_DrawElementsInstancedANGLE(GLenum mode, GLsizei count, GLenum type,
+                                 const GLvoid *indices, GLsizei numInstances)
+{
+   GET_CURRENT_CONTEXT(ctx);
+   FLUSH_FOR_DRAW(ctx);
+   _mesa_set_varying_vp_inputs(ctx, ctx->VertexProgram._VPModeInputFilter &
+                               ctx->Array._DrawVAO->_EnabledWithMapMode);
+   if (ctx->NewState)
+      _mesa_update_state(ctx);
+
+   if (!_mesa_is_no_error_enabled(ctx) &&
+       (!_mesa_validate_DrawElementsInstanced(ctx, mode, count, type, numInstances) ||
+        !validate_angle_instanced_arrays(ctx, "glDrawElementsInstancedANGLE")))
+      return;
+
+   _mesa_validated_drawrangeelements(ctx, ctx->Array.VAO->IndexBufferObj,
+                                     mode, false, 0, ~0, count, type, indices,
+                                     0, numInstances, 0);
 }
 
 

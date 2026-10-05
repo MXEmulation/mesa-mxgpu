@@ -1,3 +1,4 @@
+/* Modified by Zak Noble-Clarke for MX, 2026-10-05: implement validated ANGLE instanced arrays. */
 /* The extension table is alphabetically sorted by the extension name string column. */
 
 #define GLL 0
@@ -28,6 +29,7 @@ EXT(AMD_vertex_shader_viewport_index        , AMD_vertex_shader_viewport_index  
 
 EXT(ANDROID_extension_pack_es31a            , ANDROID_extension_pack_es31a           ,  x ,  x ,  x ,  31, 2014)
 
+EXT(ANGLE_instanced_arrays                  , ANGLE_instanced_arrays                 ,  x ,  x ,  x , ES2, 2012)
 EXT(ANGLE_pack_reverse_row_order            , dummy_true                             ,  x ,  x ,  x , ES2, 2011)
 EXT(ANGLE_texture_compression_dxt3          , ANGLE_texture_compression_dxt          , GLL, GLC, ES1, ES2, 2011)
 EXT(ANGLE_texture_compression_dxt5          , ANGLE_texture_compression_dxt          , GLL, GLC, ES1, ES2, 2011)

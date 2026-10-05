@@ -41,6 +41,7 @@ if get_option('mxgpu-tests')
     endforeach
     executable('egl_client', 'egl_client.c', c_args : '-DMXGPU_EGL_CLIENT_MAIN',
                dependencies : mxgpu_egl_deps)
+    executable('egl_instancing', 'egl_instancing.c', dependencies : mxgpu_egl_deps)
   endif
   if with_mxgpu_vk
     glslang = find_program('glslangValidator', required : true)

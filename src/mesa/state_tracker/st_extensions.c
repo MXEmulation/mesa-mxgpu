@@ -26,6 +26,8 @@
  *
  **************************************************************************/
 
+/* Modified by Zak Noble-Clarke for MX, 2026-10-05: implement validated ANGLE instanced arrays. */
+
 #include "compiler/nir/nir.h"
 
 
@@ -1039,6 +1041,9 @@ void st_init_extensions(struct pipe_screen *screen,
    };
 
 #define EXT_CAP(ext, cap) extensions->ext |= !!screen->caps.cap
+
+   extensions->ANGLE_instanced_arrays = screen->caps.vs_instanceid &&
+                                        screen->caps.vertex_element_instance_divisor;
 
    /* Expose the extensions which directly correspond to gallium caps. */
    EXT_CAP(ARB_base_instance,                start_instance);
