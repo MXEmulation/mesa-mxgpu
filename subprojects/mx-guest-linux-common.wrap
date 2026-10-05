@@ -3,6 +3,6 @@
 
 [wrap-git]
 url = https://github.com/MXEmulation/mx-guest-linux-common.git
-revision = 215ebaeb8339c21ff6d72140bff553a62ca81cb8
+revision = b11b87338faac4be47f608ab2a0dad5a9c0aef04
 depth = 1
 patch_directory = mx-guest-linux-common

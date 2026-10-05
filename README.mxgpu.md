@@ -4,13 +4,13 @@
 
 # mesa-mxgpu
 
-MX's Mesa fork for MXGPU in Linux guests.
+MX's Mesa fork for the MXGPU Gallium driver and Vulkan ICD in Linux guests.
 
 - Repository: https://github.com/MXEmulation/mesa-mxgpu
 - Upstream Mesa: https://mesa3d.org
 - Fork support: support@coretools.app
 
-The upstream source baseline is Mesa commit `503e8fe6077474c912876c8298fc7b839d90ceba`. Mesa's [README.rst](README.rst) describes the upstream project.
+The `mxgpu` source baseline is upstream Mesa commit `503e8fe6077474c912876c8298fc7b839d90ceba`, with MXGPU additions. Mesa's [README.rst](README.rst) describes the upstream project.
 
 ## Capabilities
 

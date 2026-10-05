@@ -3,4 +3,4 @@
 
 # mesa-mxgpu
 
-MX's Mesa fork for MXGPU. Fork information and licence details are in [README.mxgpu.md](../README.mxgpu.md).
+MX's Mesa fork for MXGPU. Build, capability and licence information is in [README.mxgpu.md](../README.mxgpu.md).
