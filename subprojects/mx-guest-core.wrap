@@ -3,6 +3,6 @@
 
 [wrap-git]
 url = https://github.com/MXEmulation/mx-guest-core.git
-revision = 9e3f50daf47051b8f69f125158087304cda69000
+revision = 1bf00787403b097cf96a8d9be2066af04de41370
 depth = 1
 patch_directory = mx-guest-core
