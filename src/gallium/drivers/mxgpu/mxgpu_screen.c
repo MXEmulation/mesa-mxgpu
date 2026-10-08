@@ -239,7 +239,7 @@ static bool resource_cpu_sync(struct mxgpu_resource *res, unsigned usage, bool e
         return false;
     sync.flags |= end ? DMA_BUF_SYNC_END : DMA_BUF_SYNC_START;
     for (attempt = 0; attempt < 8; attempt++) {
-        if (!ioctl(res->import_fd, DMA_BUF_IOCTL_SYNC, &sync))
+        if (!mxgpu_ioctl(res->import_fd, DMA_BUF_IOCTL_SYNC, &sync))
             return true;
         if (errno != EINTR && errno != EAGAIN)
             break;
@@ -279,10 +279,10 @@ static void mxgpu_resource_destroy(struct pipe_screen *screen, struct pipe_resou
     if (res->gem && !peer && mx->fd >= 0) {
         if (res->gem_dumb) {
             struct drm_mode_destroy_dumb destroy = { .handle = res->gem };
-            ioctl(mx->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
+            mxgpu_ioctl(mx->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
         } else {
             struct drm_gem_close close_arg = { .handle = res->gem };
-            ioctl(mx->fd, DRM_IOCTL_GEM_CLOSE, &close_arg);
+            mxgpu_ioctl(mx->fd, DRM_IOCTL_GEM_CLOSE, &close_arg);
         }
     }
     while (res->view_identities) {
@@ -310,14 +310,14 @@ static bool mxgpu_get_handle(struct pipe_screen *screen, struct pipe_context *co
         memset(&prime, 0, sizeof prime);
         prime.handle = res->gem;
         prime.flags = DRM_CLOEXEC | DRM_RDWR;
-        if (ioctl(mx->fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime))
+        if (mxgpu_ioctl(mx->fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime))
             return false;
         handle->handle = prime.fd;
     } else if (handle->type == WINSYS_HANDLE_TYPE_KMS) {
         handle->handle = res->gem;
     } else if (handle->type == WINSYS_HANDLE_TYPE_SHARED) {
         struct drm_gem_flink flink_arg = { .handle = res->gem };
-        if (ioctl(mx->fd, DRM_IOCTL_GEM_FLINK, &flink_arg))
+        if (mxgpu_ioctl(mx->fd, DRM_IOCTL_GEM_FLINK, &flink_arg))
             return false;
         handle->handle = flink_arg.name;
     } else {
@@ -378,7 +378,7 @@ static struct pipe_resource *mxgpu_resource_from_handle(struct pipe_screen *scre
     }
     prime.fd = import_fd;
     simple_mtx_lock(&mx->resource_mutex);
-    if (ioctl(mx->fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &prime)) {
+    if (mxgpu_ioctl(mx->fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &prime)) {
         simple_mtx_unlock(&mx->resource_mutex);
         munmap(mapping, statbuf.st_size);
         close(import_fd);
@@ -422,7 +422,7 @@ static bool allocate_render_gem(struct mxgpu_screen *screen, struct mxgpu_resour
     user.pointer = (uint64_t)(uintptr_t)record;
     user.size = size;
     user.capacity = sizeof record;
-    if (ioctl(screen->fd, DRM_IOWR(DRM_COMMAND_BASE + 3, struct mxgpu_drm_user), &user) ||
+    if (mxgpu_ioctl(screen->fd, DRM_IOWR(DRM_COMMAND_BASE + 3, struct mxgpu_drm_user), &user) ||
         user.size > sizeof record ||
         mxgpu_drm_gem_create_response_decode(record, user.size, &handle) != MXGPU_DRM_OK)
         return false;
@@ -430,20 +430,20 @@ static bool allocate_render_gem(struct mxgpu_screen *screen, struct mxgpu_resour
     close_arg.pad = 0;
     prime.handle = handle;
     prime.flags = DRM_CLOEXEC | DRM_RDWR;
-    if (ioctl(screen->fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime)) {
-        ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close_arg);
+    if (mxgpu_ioctl(screen->fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime)) {
+        mxgpu_ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close_arg);
         return false;
     }
     if (fstat(prime.fd, &statbuf) || statbuf.st_size < (int64_t)allocation ||
         (uint64_t)statbuf.st_size > SIZE_MAX) {
         close(prime.fd);
-        ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close_arg);
+        mxgpu_ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close_arg);
         return false;
     }
     mapping = mmap(NULL, statbuf.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, prime.fd, 0);
     if (mapping == MAP_FAILED) {
         close(prime.fd);
-        ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close_arg);
+        mxgpu_ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close_arg);
         return false;
     }
     res->gem = handle;
@@ -509,12 +509,12 @@ static struct pipe_resource *mxgpu_resource_create(struct pipe_screen *screen, c
         create.width = templ->width0;
         create.height = templ->height0 ? templ->height0 : 1;
         create.bpp = block * 8u;
-        if (!ioctl(screen_of(screen)->fd, DRM_IOCTL_MODE_CREATE_DUMB, &create)) {
+        if (!mxgpu_ioctl(screen_of(screen)->fd, DRM_IOCTL_MODE_CREATE_DUMB, &create)) {
             memset(&map, 0, sizeof map);
             map.handle = create.handle;
             if (create.pitch >= res->stride && create.size <= UINT_MAX &&
                 create.size >= (uint64_t)create.pitch * create.height &&
-                !ioctl(screen_of(screen)->fd, DRM_IOCTL_MODE_MAP_DUMB, &map)) {
+                !mxgpu_ioctl(screen_of(screen)->fd, DRM_IOCTL_MODE_MAP_DUMB, &map)) {
                 ptr = mmap(NULL, create.size, PROT_READ | PROT_WRITE, MAP_SHARED, screen_of(screen)->fd, map.offset);
                 if (ptr != MAP_FAILED) {
                     res->data = ptr;
@@ -528,7 +528,7 @@ static struct pipe_resource *mxgpu_resource_create(struct pipe_screen *screen, c
             }
             if (!res->dumb) {
                 struct drm_mode_destroy_dumb destroy = { .handle = create.handle };
-                ioctl(screen_of(screen)->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
+                mxgpu_ioctl(screen_of(screen)->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
             }
         }
     }

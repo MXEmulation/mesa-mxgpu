@@ -279,7 +279,7 @@ static int open_render_node(char *path, size_t path_size)
                 err = errno;
                 continue;
             }
-            if (ioctl(candidate, DRM_IOCTL_VERSION, &version) == 0 &&
+            if (mxgpu_ioctl(candidate, DRM_IOCTL_VERSION, &version) == 0 &&
                 version.name_len == 5 && memcmp(name, "mxgpu", 5) == 0) {
                 fd = candidate;
                 snprintf(path, path_size, "%s", nodes.gl_pathv[i]);
@@ -408,7 +408,7 @@ static int batch_drain_unlocked(void)
     if (mxgpu_drm_batch_encode(&g_dev.batch, record, capacity, &bytes) != MXGPU_DRM_OK) return -1;
     struct mxgpu_drm_user user = { .pointer = (uint64_t)(uintptr_t)record,
         .size = bytes, .capacity = capacity };
-    int result = ioctl(g_dev.fd, DRM_IOWR(DRM_COMMAND_BASE + MXGPU_DRM_IOCTL_SUBMIT_BATCH,
+    int result = mxgpu_ioctl(g_dev.fd, DRM_IOWR(DRM_COMMAND_BASE + MXGPU_DRM_IOCTL_SUBMIT_BATCH,
                        struct mxgpu_drm_user), &user);
     int saved_errno = errno;
     struct mxgpu_drm_batch_response response;
@@ -567,7 +567,7 @@ static int winsys_submit_ioctl(uint16_t opcode, uint16_t queue, uint32_t context
     user.size = record_len;
     user.capacity = record_cap;
     if (g_dev.fd >= 0) {
-        int posted = ioctl(g_dev.fd, DRM_IOWR(DRM_COMMAND_BASE + 5, struct mxgpu_drm_user), &user);
+        int posted = mxgpu_ioctl(g_dev.fd, DRM_IOWR(DRM_COMMAND_BASE + 5, struct mxgpu_drm_user), &user);
         int submit_errno = errno;
         if (posted < 0) {
             if (submit_errno == EIO) {
@@ -1870,7 +1870,7 @@ static int readback_rows(struct resource *color, unsigned y0, unsigned rows)
     user.pointer = (uint64_t)(uintptr_t)buf;
     user.size = record_len;
     user.capacity = capacity;
-    posted = ioctl(g_dev.fd, DRM_IOWR(DRM_COMMAND_BASE + 5, struct mxgpu_drm_user), &user);
+    posted = mxgpu_ioctl(g_dev.fd, DRM_IOWR(DRM_COMMAND_BASE + 5, struct mxgpu_drm_user), &user);
     if (posted < 0 && (errno == EPIPE || errno == ENODEV || errno == ETIMEDOUT))
         g_dev.lost = 1;
     if (posted < 0 || user.size != bytes) {
@@ -2169,7 +2169,7 @@ static int query_adapter_unlocked(void)
     user.pointer = (uint64_t)(uintptr_t)record;
     user.size = record_len;
     user.capacity = sizeof record;
-    int result = ioctl(g_dev.fd, DRM_IOWR(DRM_COMMAND_BASE + 5, struct mxgpu_drm_user), &user);
+    int result = mxgpu_ioctl(g_dev.fd, DRM_IOWR(DRM_COMMAND_BASE + 5, struct mxgpu_drm_user), &user);
     if (result < 0 && (errno == EPIPE || errno == ENODEV || errno == ETIMEDOUT))
         g_dev.lost = 1;
     if (result < 0 || mxgpu_adapter_info_decode(record, user.size, &g_dev.adapter_info) != MX_OK)
@@ -2200,7 +2200,7 @@ static int native_color_sample_available_unlocked(void)
         user.pointer = (uint64_t)(uintptr_t)record;
         user.size = record_size;
         user.capacity = sizeof record;
-        int posted = ioctl(g_dev.fd, DRM_IOWR(DRM_COMMAND_BASE + 5, struct mxgpu_drm_user), &user);
+        int posted = mxgpu_ioctl(g_dev.fd, DRM_IOWR(DRM_COMMAND_BASE + 5, struct mxgpu_drm_user), &user);
         if (posted < 0 && (errno == EPIPE || errno == ENODEV || errno == ETIMEDOUT)) g_dev.lost = 1;
         if (posted < 0 || mxgpu_format_capabilities_decode(record, user.size,
                 g_dev.adapter_info.pixel_format_mask, &g_dev.format_caps) != MX_OK) return 0;
@@ -3116,7 +3116,7 @@ static void private_context_release(void)
         user.pointer = (uint64_t)(uintptr_t)record;
         user.size = size;
         user.capacity = sizeof record;
-        ioctl(g_dev.fd, DRM_IOWR(DRM_COMMAND_BASE + 2, struct mxgpu_drm_user), &user);
+        mxgpu_ioctl(g_dev.fd, DRM_IOWR(DRM_COMMAND_BASE + 2, struct mxgpu_drm_user), &user);
     }
     g_dev.context_owned = 0;
 }
@@ -3137,7 +3137,7 @@ static int device_initialize(int fd, int allow_executor)
             caps_user.pointer = (uint64_t)(uintptr_t)caps_record;
             caps_user.size = caps_size;
             caps_user.capacity = sizeof caps_record;
-            if (ioctl(fd, DRM_IOWR(DRM_COMMAND_BASE + 9, struct mxgpu_drm_user), &caps_user) == 0 &&
+            if (mxgpu_ioctl(fd, DRM_IOWR(DRM_COMMAND_BASE + 9, struct mxgpu_drm_user), &caps_user) == 0 &&
                 caps_user.size <= sizeof caps_record)
                 mxgpu_drm_get_caps_response_decode(caps_record, caps_user.size, &g_dev.caps);
         }
@@ -3148,7 +3148,7 @@ static int device_initialize(int fd, int allow_executor)
             transfer_user.pointer = (uint64_t)(uintptr_t)transfer_record;
             transfer_user.size = transfer_size;
             transfer_user.capacity = sizeof transfer_record;
-            if (ioctl(fd, DRM_IOWR(DRM_COMMAND_BASE + 10, struct mxgpu_drm_user), &transfer_user) == 0 &&
+            if (mxgpu_ioctl(fd, DRM_IOWR(DRM_COMMAND_BASE + 10, struct mxgpu_drm_user), &transfer_user) == 0 &&
                 transfer_user.size <= sizeof transfer_record)
                 mxgpu_drm_get_transfer_limits_response_decode(transfer_record, transfer_user.size, &g_dev.transfer_limits);
         }
@@ -3159,7 +3159,7 @@ static int device_initialize(int fd, int allow_executor)
             batch_user.pointer = (uint64_t)(uintptr_t)batch_record;
             batch_user.size = batch_size;
             batch_user.capacity = sizeof batch_record;
-            if (!ioctl(fd, DRM_IOWR(DRM_COMMAND_BASE + MXGPU_DRM_IOCTL_GET_BATCH_LIMITS,
+            if (!mxgpu_ioctl(fd, DRM_IOWR(DRM_COMMAND_BASE + MXGPU_DRM_IOCTL_GET_BATCH_LIMITS,
                                    struct mxgpu_drm_user), &batch_user) && batch_user.size <= sizeof batch_record)
                 mxgpu_drm_get_batch_limits_response_decode(batch_record, batch_user.size, &g_dev.batch_limits);
         }
@@ -3171,7 +3171,7 @@ static int device_initialize(int fd, int allow_executor)
         user.pointer = (uint64_t)(uintptr_t)record;
         user.size = size;
         user.capacity = sizeof record;
-        if (ioctl(fd, DRM_IOWR(DRM_COMMAND_BASE + 1, struct mxgpu_drm_user), &user) < 0 ||
+        if (mxgpu_ioctl(fd, DRM_IOWR(DRM_COMMAND_BASE + 1, struct mxgpu_drm_user), &user) < 0 ||
             user.size > sizeof record ||
             mxgpu_drm_ctx_create_response_decode(record, user.size, &g_dev.context) != MXGPU_DRM_OK)
             goto failed;
@@ -3427,7 +3427,7 @@ static int native_depth_available_unlocked(uint32_t format)
             mxgpu_drm_submit_encode(0, MXGPU_QUEUE_CONTROL, header.fence_value,
                 MXGPU_FORMAT_CAPABILITIES_SIZE, command, command_len, record, sizeof record, &record_len) != MXGPU_DRM_OK) return 0;
         user.pointer = (uint64_t)(uintptr_t)record; user.size = record_len; user.capacity = sizeof record;
-        int posted = ioctl(g_dev.fd, DRM_IOWR(DRM_COMMAND_BASE + 5, struct mxgpu_drm_user), &user);
+        int posted = mxgpu_ioctl(g_dev.fd, DRM_IOWR(DRM_COMMAND_BASE + 5, struct mxgpu_drm_user), &user);
         if (posted < 0 && (errno == EPIPE || errno == ENODEV || errno == ETIMEDOUT))
             g_dev.lost = 1;
         if (posted < 0 || user.size != MXGPU_FORMAT_CAPABILITIES_SIZE ||
@@ -3733,7 +3733,7 @@ static int native_caps_match(int fd, uint64_t required, unsigned minimum_minor)
     user.pointer = (uint64_t)(uintptr_t)record;
     user.size = size;
     user.capacity = sizeof record;
-    if (ioctl(fd, DRM_IOWR(DRM_COMMAND_BASE + 9, struct mxgpu_drm_user), &user) < 0 ||
+    if (mxgpu_ioctl(fd, DRM_IOWR(DRM_COMMAND_BASE + 9, struct mxgpu_drm_user), &user) < 0 ||
         user.size > sizeof record ||
         mxgpu_drm_get_caps_response_decode(record, user.size, &caps) != MXGPU_DRM_OK)
         return 0;

@@ -6,6 +6,23 @@
 #include <stdint.h>
 #include "mxgpu_wire.h"
 #include "mxgpu_drm_uapi.h"
+#include <errno.h>
+#include <string.h>
+#include <sys/ioctl.h>
+
+static inline int mxgpu_ioctl(int fd, unsigned long request, void *arg)
+{
+    unsigned char saved[512];
+    size_t size = _IOC_SIZE(request);
+    int result;
+
+    if (size > sizeof saved)
+        return ioctl(fd, request, arg);
+    memcpy(saved, arg, size);
+    while ((result = ioctl(fd, request, arg)) == -1 && (errno == EINTR || errno == EAGAIN))
+        memcpy(arg, saved, size);
+    return result;
+}
 
 #define MXGPU_FB_SIZE 64
 
