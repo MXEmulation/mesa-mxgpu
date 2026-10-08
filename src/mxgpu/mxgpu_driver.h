@@ -144,5 +144,22 @@ int mxgpu_execute_scene(const float *vertices, int vertex_count,
                         const unsigned char *texels, int tw, int th,
                         unsigned char *color, int cw, int ch);
 
+struct mxgpu_compute_binding {
+    uint16_t slot;
+    uint16_t access;
+    uint32_t buffer;
+    uint64_t offset;
+    uint64_t size;
+};
+int mxgpu_compute_available(void);
+uint32_t mxgpu_storage_buffer_create(uint32_t size);
+int mxgpu_storage_buffer_upload(uint32_t buffer, uint32_t offset, const void *data, uint32_t size);
+int mxgpu_storage_buffer_read(uint32_t buffer, uint32_t offset, void *data, uint32_t size);
+int mxgpu_storage_buffer_destroy(uint32_t buffer);
+uint32_t mxgpu_compute_pipeline_create(const uint8_t *module, uint32_t module_len, uint32_t entry);
+int mxgpu_compute_pipeline_destroy(uint32_t pipeline);
+int mxgpu_compute_dispatch(uint32_t pipeline, uint16_t dispatch_kind, const uint32_t dimensions[3],
+                           const struct mxgpu_compute_binding *bindings, uint32_t binding_count);
+
 
 #endif

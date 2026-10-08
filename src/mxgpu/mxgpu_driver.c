@@ -56,6 +56,7 @@ struct resource {
     unsigned mip_offsets[32];
     unsigned dirty_begin;
     unsigned dirty_end;
+    int storage;
 };
 
 struct shader_image {
@@ -103,6 +104,13 @@ struct vertex_cache_entry {
     int blocked, uncertain_create;
 };
 
+#define MXGPU_COMPUTE_PIPELINES 8u
+
+struct compute_pipeline_entry {
+    uint32_t shader_id, pipeline_id;
+    int shader_live, pipeline_live;
+};
+
 struct scratch_buffer {
     uint8_t *bytes;
     uint32_t capacity;
@@ -148,6 +156,7 @@ struct device {
     uint64_t uniform_cache_clock;
     struct native_pipeline_cache_entry module_cache[8];
     uint32_t module_cache_next_id;
+    struct compute_pipeline_entry compute_pipes[MXGPU_COMPUTE_PIPELINES];
     uint64_t module_cache_clock;
     unsigned shader_id;
     unsigned pipeline_id;
@@ -191,6 +200,7 @@ struct device {
 
 static int apply_decoded(uint16_t opcode, const uint8_t *payload, uint32_t len);
 static int mxgpu_debug_illegal_then_legal_unlocked(void);
+static int compute_pipeline_entry_destroy(struct compute_pipeline_entry *entry);
 
 static struct device g_dev = {.fd = -1};
 static pthread_mutex_t g_device_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -3383,6 +3393,9 @@ static void mxgpu_device_close_unlocked(void)
     if (g_dev.fd >= 0 && g_dev.context_owned && g_dev.open && !g_dev.lost) {
         for (i = 0; i < 8 && !g_dev.lost; i++)
             native_pipeline_entry_destroy(&g_dev.module_cache[i]);
+        for (i = 0; i < MXGPU_COMPUTE_PIPELINES && !g_dev.lost; i++)
+            if (compute_pipeline_entry_destroy(&g_dev.compute_pipes[i]))
+                g_dev.lost = 1;
         native_cache_release_all();
         uint8_t payload[MXGPU_RESOURCE_ID_SIZE];
         uint32_t size;
@@ -3972,4 +3985,321 @@ int mxgpu_execute_module_transaction_native_stride(int fd, const uint8_t *module
     return mxgpu_execute_module_transaction_native_resources(fd, module, module_len, vertices, vertex_count,
         texels, tw, th, initial_color, color, cw, ch, vertex_uniforms, vertex_uniform_size,
         fragment_uniforms, fragment_uniform_size, readback_complete, state, vertex_stride_bytes, NULL, 0);
+}
+
+#define MXGPU_COMPUTE_BINDINGS 16u
+
+static int compute_ready_unlocked(void)
+{
+    return g_dev.open && g_dev.fd >= 0 && !g_dev.lost &&
+           mxgpu_compute_submit_features(g_dev.caps.features) == MX_OK &&
+           g_dev.caps.max_queues > MXGPU_QUEUE_COMPUTE;
+}
+
+static struct resource *storage_slot(uint32_t id)
+{
+    struct resource *res = res_slot(id);
+    return res && res->storage && res->host_live ? res : NULL;
+}
+
+static int compute_pipeline_entry_destroy(struct compute_pipeline_entry *entry)
+{
+    uint8_t payload[MXGPU_RESOURCE_ID_SIZE];
+    uint32_t bytes;
+    if (entry->pipeline_live) {
+        if (mxgpu_resource_id_encode(entry->pipeline_id, payload, sizeof payload, &bytes) != MX_OK ||
+            winsys_submit_ioctl(MXGPU_OP_PIPELINE_DESTROY, MXGPU_QUEUE_CONTROL, g_dev.context, payload, bytes))
+            return -1;
+        entry->pipeline_live = 0;
+    }
+    if (entry->shader_live) {
+        if (mxgpu_resource_id_encode(entry->shader_id, payload, sizeof payload, &bytes) != MX_OK ||
+            winsys_submit_ioctl(MXGPU_OP_SHADER_DESTROY, MXGPU_QUEUE_CONTROL, g_dev.context, payload, bytes))
+            return -1;
+        entry->shader_live = 0;
+    }
+    memset(entry, 0, sizeof *entry);
+    return 0;
+}
+
+static struct compute_pipeline_entry *compute_pipeline_find(uint32_t pipeline)
+{
+    for (unsigned i = 0; pipeline && i < MXGPU_COMPUTE_PIPELINES; i++)
+        if (g_dev.compute_pipes[i].pipeline_live && g_dev.compute_pipes[i].pipeline_id == pipeline)
+            return &g_dev.compute_pipes[i];
+    return NULL;
+}
+
+static uint32_t storage_buffer_create_unlocked(uint32_t size)
+{
+    struct mxgpu_resource_create create;
+    uint8_t payload[64];
+    uint32_t n = 0;
+    unsigned id;
+    if (!compute_ready_unlocked() || !size || batch_drain_unlocked())
+        return 0;
+    id = new_resource(MXGPU_KIND_BUFFER, size, 1, size);
+    if (!id)
+        return 0;
+    memset(&create, 0, sizeof create);
+    create.resource_id = id;
+    create.kind = MXGPU_KIND_BUFFER;
+    create.usage = MXGPU_USAGE_STORAGE | MXGPU_USAGE_TRANSFER_SOURCE | MXGPU_USAGE_TRANSFER_DESTINATION;
+    create.width = size;
+    create.height = 1;
+    create.depth = 1;
+    create.array_layers = 1;
+    create.mip_levels = 1;
+    create.sample_count = 1;
+    create.byte_size = size;
+    if (mxgpu_resource_create_encode(&create, g_dev.adapter_info_valid ? g_dev.adapter_info.max_buffer_bytes : 64ull << 20,
+                                     payload, sizeof payload, &n) != MX_OK ||
+        resource_create_submit(payload, n)) {
+        free(g_dev.resources[id].bytes);
+        memset(&g_dev.resources[id], 0, sizeof g_dev.resources[id]);
+        return 0;
+    }
+    g_dev.resources[id].storage = 1;
+    g_dev.resources[id].host_live = 1;
+    g_dev.resources[id].host_bytes = size;
+    g_dev.resources[id].host_usage = create.usage;
+    g_dev.resources[id].host_current = 0;
+    g_dev.resources[id].dirty_begin = 0;
+    g_dev.resources[id].dirty_end = size;
+    return id;
+}
+
+static int storage_buffer_upload_unlocked(uint32_t buffer, uint32_t offset, const void *data, uint32_t size)
+{
+    struct resource *res = storage_slot(buffer);
+    if (!compute_ready_unlocked() || !res || !data || !size || offset > res->size || size > res->size - offset)
+        return -1;
+    memcpy(res->bytes + offset, data, size);
+    if (res->host_current || res->dirty_begin >= res->dirty_end) {
+        res->dirty_begin = offset;
+        res->dirty_end = offset + size;
+    } else {
+        if (offset < res->dirty_begin) res->dirty_begin = offset;
+        if (offset + size > res->dirty_end) res->dirty_end = offset + size;
+    }
+    res->host_current = 0;
+    if (transfer_bytes(buffer) || batch_drain_unlocked())
+        return -1;
+    return 0;
+}
+
+static int storage_read_span(uint32_t id, uint32_t offset, uint8_t *out, uint32_t bytes)
+{
+    struct mxgpu_command_header header;
+    struct mxgpu_drm_user user;
+    struct mxgpu_transfer request;
+    uint8_t payload[MXGPU_TRANSFER_REQUEST_SIZE];
+    uint8_t command[128];
+    uint32_t payload_len = 0, command_len = 0, record_len = 0, capacity;
+    uint8_t *record;
+    memset(&request, 0, sizeof request);
+    request.resource_id = id;
+    request.resource_offset = offset;
+    request.data_bytes = bytes;
+    if (mxgpu_transfer_request_encode(&request, payload, sizeof payload, &payload_len) != MX_OK)
+        return -1;
+    memset(&header, 0, sizeof header);
+    header.opcode = MXGPU_OP_TRANSFER_FROM_HOST;
+    header.flags = MXGPU_CMD_SIGNAL_FENCE | MXGPU_CMD_RESPONSE_REQUIRED;
+    header.context_id = g_dev.context;
+    header.queue = MXGPU_QUEUE_TRANSFER;
+    header.sequence = take_sequence();
+    header.fence_value = header.sequence;
+    if (mxgpu_command_encode(&header, payload, payload_len,
+                             g_dev.caps.max_command_bytes ? g_dev.caps.max_command_bytes : 65536,
+                             command, sizeof command, &command_len) != MX_OK)
+        return -1;
+    capacity = bytes > sizeof command + 512u ? bytes : sizeof command + 512u;
+    record = scratch_reserve(&g_dev.readback_scratch, capacity);
+    if (!record ||
+        mxgpu_drm_submit_encode(g_dev.context, MXGPU_QUEUE_TRANSFER, header.fence_value, bytes, command,
+                                command_len, record, capacity, &record_len) != MXGPU_DRM_OK)
+        return -1;
+    memset(&user, 0, sizeof user);
+    user.pointer = (uint64_t)(uintptr_t)record;
+    user.size = record_len;
+    user.capacity = capacity;
+    int posted = mxgpu_ioctl(g_dev.fd, DRM_IOWR(DRM_COMMAND_BASE + 5, struct mxgpu_drm_user), &user);
+    if (posted < 0 && (errno == EPIPE || errno == ENODEV || errno == ETIMEDOUT))
+        g_dev.lost = 1;
+    if (posted < 0 || user.size != bytes)
+        return -1;
+    memcpy(out, record, bytes);
+    return 0;
+}
+
+static int storage_buffer_read_unlocked(uint32_t buffer, uint32_t offset, void *data, uint32_t size)
+{
+    struct resource *res = storage_slot(buffer);
+    unsigned limit = readback_limit();
+    if (!compute_ready_unlocked() || !res || !data || !size || !limit ||
+        offset > res->size || size > res->size - offset || batch_drain_unlocked())
+        return -1;
+    if (!res->host_current && transfer_bytes(buffer))
+        return -1;
+    for (uint32_t done = 0; done < size;) {
+        uint32_t n = size - done < limit ? size - done : limit;
+        if (storage_read_span(buffer, offset + done, res->bytes + offset + done, n))
+            return -1;
+        done += n;
+    }
+    memcpy(data, res->bytes + offset, size);
+    return 0;
+}
+
+static int storage_buffer_destroy_unlocked(uint32_t buffer)
+{
+    struct resource *res = storage_slot(buffer);
+    if (!res || g_dev.lost || batch_drain_unlocked() || destroy_resource(buffer))
+        return -1;
+    free(res->bytes);
+    memset(res, 0, sizeof *res);
+    return 0;
+}
+
+static uint32_t compute_pipeline_create_unlocked(const uint8_t *module, uint32_t module_len, uint32_t entry)
+{
+    struct compute_pipeline_entry *slot = NULL;
+    struct mxsb_limits limits;
+    uint8_t payload[MXGPU_PIPELINE_CREATE_SIZE];
+    uint32_t bytes = 0, id;
+    uint8_t *shader_payload;
+    int result;
+    if (!compute_ready_unlocked() || !module || !module_len || !entry ||
+        module_len > UINT32_MAX - MXGPU_SHADER_CREATE_HEADER_SIZE ||
+        mxsb_limits_default(&limits) != MXSB_OK || mxsb_verify(module, module_len, &limits) != MXSB_OK)
+        return 0;
+    for (unsigned i = 0; i < MXGPU_COMPUTE_PIPELINES && !slot; i++)
+        if (!g_dev.compute_pipes[i].pipeline_live && !g_dev.compute_pipes[i].shader_live)
+            slot = &g_dev.compute_pipes[i];
+    if (!slot || g_dev.module_cache_next_id == UINT32_MAX || batch_drain_unlocked())
+        return 0;
+    id = ++g_dev.module_cache_next_id;
+    shader_payload = malloc(module_len + MXGPU_SHADER_CREATE_HEADER_SIZE);
+    if (!shader_payload)
+        return 0;
+    result = mxgpu_shader_create_encode(id, module, module_len, shader_payload,
+                                        module_len + MXGPU_SHADER_CREATE_HEADER_SIZE, &bytes);
+    if (!result)
+        result = winsys_submit_ioctl(MXGPU_OP_SHADER_CREATE, MXGPU_QUEUE_CONTROL, g_dev.context, shader_payload, bytes);
+    free(shader_payload);
+    if (result)
+        return 0;
+    slot->shader_id = slot->pipeline_id = id;
+    slot->shader_live = 1;
+    if (mxgpu_pipeline_create_encode(id, MXGPU_PIPELINE_COMPUTE, 0, id, entry, 0, payload, sizeof payload, &bytes) != MX_OK ||
+        winsys_submit_ioctl(MXGPU_OP_PIPELINE_CREATE, MXGPU_QUEUE_CONTROL, g_dev.context, payload, bytes)) {
+        if (compute_pipeline_entry_destroy(slot))
+            g_dev.lost = 1;
+        return 0;
+    }
+    slot->pipeline_live = 1;
+    return id;
+}
+
+static int compute_dispatch_unlocked(uint32_t pipeline, uint16_t dispatch_kind, const uint32_t dimensions[3],
+                                     const struct mxgpu_compute_binding *bindings, uint32_t binding_count)
+{
+    struct mxgpu_execution_binding wire[MXGPU_COMPUTE_BINDINGS];
+    struct mxgpu_compute_submit submit;
+    uint8_t payload[MXGPU_COMPUTE_SUBMIT_HEADER_SIZE + MXGPU_COMPUTE_BINDINGS * MXGPU_EXECUTION_BINDING_SIZE];
+    uint32_t bytes = 0;
+    if (!compute_ready_unlocked() || !compute_pipeline_find(pipeline) || !dimensions ||
+        binding_count > MXGPU_COMPUTE_BINDINGS || (binding_count && !bindings) || batch_drain_unlocked())
+        return -1;
+    memset(wire, 0, sizeof wire);
+    for (uint32_t i = 0; i < binding_count; i++) {
+        struct resource *res = storage_slot(bindings[i].buffer);
+        if (!res || !bindings[i].size || bindings[i].offset > res->size ||
+            bindings[i].size > res->size - bindings[i].offset)
+            return -1;
+        if (!res->host_current && transfer_bytes(bindings[i].buffer))
+            return -1;
+        wire[i].slot = bindings[i].slot;
+        wire[i].access = bindings[i].access;
+        wire[i].kind = MXGPU_BIND_KIND_BUFFER;
+        wire[i].resource_id = bindings[i].buffer;
+        wire[i].offset = bindings[i].offset;
+        wire[i].size = bindings[i].size;
+    }
+    memset(&submit, 0, sizeof submit);
+    submit.pipeline_id = pipeline;
+    submit.binding_count = (uint16_t)binding_count;
+    submit.dispatch_kind = dispatch_kind;
+    memcpy(submit.dimensions, dimensions, sizeof submit.dimensions);
+    if (mxgpu_compute_submit_encode(&submit, binding_count ? wire : NULL, payload, sizeof payload, &bytes) != MX_OK ||
+        batch_drain_unlocked())
+        return -1;
+    return winsys_submit_ioctl(MXGPU_OP_COMPUTE_SUBMIT, MXGPU_QUEUE_COMPUTE, g_dev.context, payload, bytes) ? -1 : 0;
+}
+
+int mxgpu_compute_available(void)
+{
+    pthread_mutex_lock(&g_device_mutex);
+    int available = compute_ready_unlocked();
+    pthread_mutex_unlock(&g_device_mutex);
+    return available;
+}
+
+uint32_t mxgpu_storage_buffer_create(uint32_t size)
+{
+    pthread_mutex_lock(&g_device_mutex);
+    uint32_t id = storage_buffer_create_unlocked(size);
+    pthread_mutex_unlock(&g_device_mutex);
+    return id;
+}
+
+int mxgpu_storage_buffer_upload(uint32_t buffer, uint32_t offset, const void *data, uint32_t size)
+{
+    pthread_mutex_lock(&g_device_mutex);
+    int result = storage_buffer_upload_unlocked(buffer, offset, data, size);
+    pthread_mutex_unlock(&g_device_mutex);
+    return result;
+}
+
+int mxgpu_storage_buffer_read(uint32_t buffer, uint32_t offset, void *data, uint32_t size)
+{
+    pthread_mutex_lock(&g_device_mutex);
+    int result = storage_buffer_read_unlocked(buffer, offset, data, size);
+    pthread_mutex_unlock(&g_device_mutex);
+    return result;
+}
+
+int mxgpu_storage_buffer_destroy(uint32_t buffer)
+{
+    pthread_mutex_lock(&g_device_mutex);
+    int result = storage_buffer_destroy_unlocked(buffer);
+    pthread_mutex_unlock(&g_device_mutex);
+    return result;
+}
+
+uint32_t mxgpu_compute_pipeline_create(const uint8_t *module, uint32_t module_len, uint32_t entry)
+{
+    pthread_mutex_lock(&g_device_mutex);
+    uint32_t id = compute_pipeline_create_unlocked(module, module_len, entry);
+    pthread_mutex_unlock(&g_device_mutex);
+    return id;
+}
+
+int mxgpu_compute_pipeline_destroy(uint32_t pipeline)
+{
+    pthread_mutex_lock(&g_device_mutex);
+    struct compute_pipeline_entry *entry = compute_pipeline_find(pipeline);
+    int result = !entry || g_dev.lost || batch_drain_unlocked() ? -1 : compute_pipeline_entry_destroy(entry);
+    pthread_mutex_unlock(&g_device_mutex);
+    return result;
+}
+
+int mxgpu_compute_dispatch(uint32_t pipeline, uint16_t dispatch_kind, const uint32_t dimensions[3],
+                           const struct mxgpu_compute_binding *bindings, uint32_t binding_count)
+{
+    pthread_mutex_lock(&g_device_mutex);
+    int result = compute_dispatch_unlocked(pipeline, dispatch_kind, dimensions, bindings, binding_count);
+    pthread_mutex_unlock(&g_device_mutex);
+    return result;
 }
