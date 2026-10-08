@@ -18,3 +18,4 @@
 /src/mxgpu/egl_instancing
 /src/mxgpu/cs_smoke
 /src/mxgpu/vk_compute
+/src/mxgpu/vk_core11

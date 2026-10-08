@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 Zak Noble-Clarke
+#version 450
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) uniform Block { uvec4 first; uvec4 second; } block;
+layout(set = 0, binding = 1) buffer Result { uint values[]; } result;
+void main()
+{
+    result.values[0] = block.first.x;
+    result.values[1] = block.first.w;
+    result.values[2] = block.second.x;
+    result.values[3] = block.second.w;
+}

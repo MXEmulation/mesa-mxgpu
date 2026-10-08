@@ -72,5 +72,20 @@ if get_option('mxgpu-tests')
                  include_directories : include_directories('.'),
                  dependencies : [vulkan_loader] + mxgpu_protocol_deps + (validation == 'vk_client' ? [dep_dl] : []))
     endforeach
+    core11_shaders = []
+    foreach shader : [
+      ['core11-copy.comp', 'core11-copy-comp.h', 'core11_copy'],
+      ['core11-alias.comp', 'core11-alias-comp.h', 'core11_alias'],
+      ['core11-uniform.comp', 'core11-uniform-comp.h', 'core11_uniform'],
+      ['core11.vert', 'core11-vert.h', 'core11_vertex'],
+      ['core11.frag', 'core11-frag.h', 'core11_fragment'],
+    ]
+      core11_shaders += custom_target(
+        shader[1], input : shader[0], output : shader[1],
+        command : [glslang, '-V', '--target-env', 'vulkan1.1', '--vn', shader[2], '-o', '@OUTPUT@', '@INPUT@'],
+      )
+    endforeach
+    executable('vk_core11', files('vk_core11.c') + core11_shaders,
+               dependencies : [vulkan_loader])
   endif
 endif

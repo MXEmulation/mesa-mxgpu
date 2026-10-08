@@ -22,8 +22,24 @@
 #define MXGPU_VK_STAGES 3u
 #define MXGPU_VK_COMPUTE_STAGE 2u
 #define MXGPU_VK_STORAGE_OFFSET_ALIGNMENT 16u
+#define MXGPU_VK_API_VERSION VK_API_VERSION_1_1
+#define MXGPU_VK_MAX_IMAGE_DIMENSION 2048u
+#define MXGPU_VK_UNIFORM_BUFFER_RANGE 65536u
+#define MXGPU_VK_STAGE_UNIFORM_BUFFERS (MXGPU_UNIFORM_BUFFERS - 1u)
+#define MXGPU_VK_INTERSTAGE_COMPONENTS 128u
+#define MXGPU_VK_MAP_ALIGNMENT 64u
+#define MXGPU_VK_MAX_BOUND_SETS 8u
+#define MXGPU_VK_MAX_PER_SET_DESCRIPTORS 1024u
+#define MXGPU_VK_DRIVER_ID ((VkDriverId)0x4d584750)
 static const uint8_t mx_pipeline_cache_uuid[VK_UUID_SIZE] = {
     'M', 'X', 'G', 'P', 'U', '-', 'S', 'P', 'I', 'R', 'V', '-', '0', '0', '0', '1'
+};
+static const uint8_t mx_device_uuid[VK_UUID_SIZE] = {
+    'M', 'X', 'G', 'P', 'U', '-', 'D', 'E', 'V', 'I', 'C', 'E',
+    MX_PCI_VENDOR_ID >> 8, MX_PCI_VENDOR_ID & 0xff, MXGPU_PCI_DEVICE_ID >> 8, MXGPU_PCI_DEVICE_ID & 0xff
+};
+static const uint8_t mx_driver_uuid[VK_UUID_SIZE] = {
+    'M', 'X', 'G', 'P', 'U', '-', 'V', 'U', 'L', 'K', 'A', 'N', '-', '0', '0', '1'
 };
 
 struct mx_pipeline_layout;
@@ -424,37 +440,100 @@ static bool vk_compute_supported(void)
     return mxgpu_device_open() == 0 && mxgpu_compute_available();
 }
 
+static uint32_t vk_stage_textures(void)
+{
+    uint32_t textures = MXGPU_SHADER_TEXTURES < MXGPU_TEXTURE_INPUTS ? MXGPU_SHADER_TEXTURES : MXGPU_TEXTURE_INPUTS;
+    return mxgpu_native_sampler_available(-1) ? textures : 1;
+}
+
 static void device_props(VkPhysicalDevice gpu, VkPhysicalDeviceProperties *props)
 {
+    VkPhysicalDeviceLimits *limits = &props->limits;
+    uint32_t textures = vk_stage_textures();
+    bool compute = vk_compute_supported();
     (void)gpu;
     memset(props, 0, sizeof *props);
-    props->apiVersion = VK_API_VERSION_1_0;
-    props->driverVersion = VK_MAKE_VERSION(1, 0, 0);
+    props->apiVersion = MXGPU_VK_API_VERSION;
+    props->driverVersion = VK_MAKE_VERSION(MXGPU_DRIVER_VERSION_MAJOR, MXGPU_DRIVER_VERSION_MINOR,
+                                           MXGPU_DRIVER_VERSION_PATCH);
     props->vendorID = MX_PCI_VENDOR_ID;
     props->deviceID = MXGPU_PCI_DEVICE_ID;
     memcpy(props->pipelineCacheUUID, mx_pipeline_cache_uuid, VK_UUID_SIZE);
     props->deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
     memcpy(props->deviceName, "MXGPU", 6);
-    props->limits.maxImageDimension2D = 2048;
-    props->limits.maxVertexInputAttributes = 32;
-    props->limits.maxVertexInputBindings = 32;
-    props->limits.maxVertexInputAttributeOffset = UINT32_MAX;
-    props->limits.maxVertexInputBindingStride = UINT32_MAX;
-    props->limits.maxPushConstantsSize = MXGPU_VK_PUSH_CONSTANT_BYTES;
-    if (vk_compute_supported()) {
-        props->limits.maxComputeSharedMemorySize = 16384;
-        props->limits.maxComputeWorkGroupCount[0] = 65535;
-        props->limits.maxComputeWorkGroupCount[1] = 65535;
-        props->limits.maxComputeWorkGroupCount[2] = 65535;
-        props->limits.maxComputeWorkGroupInvocations = 128;
-        props->limits.maxComputeWorkGroupSize[0] = 128;
-        props->limits.maxComputeWorkGroupSize[1] = 128;
-        props->limits.maxComputeWorkGroupSize[2] = 64;
-        props->limits.maxStorageBufferRange = (uint32_t)MXGPU_VK_HEAP_BYTES;
-        props->limits.minStorageBufferOffsetAlignment = MXGPU_VK_STORAGE_OFFSET_ALIGNMENT;
-        props->limits.maxPerStageDescriptorStorageBuffers = MXGPU_SHADER_STORAGE_BUFFERS;
-        props->limits.maxDescriptorSetStorageBuffers = MXGPU_SHADER_STORAGE_BUFFERS;
-        props->limits.maxDescriptorSetStorageBuffersDynamic = MXGPU_SHADER_STORAGE_BUFFERS;
+    limits->maxImageDimension2D = MXGPU_VK_MAX_IMAGE_DIMENSION;
+    limits->maxImageArrayLayers = 1;
+    limits->maxUniformBufferRange = MXGPU_VK_UNIFORM_BUFFER_RANGE;
+    limits->maxPushConstantsSize = MXGPU_VK_PUSH_CONSTANT_BYTES;
+    limits->maxMemoryAllocationCount = 4096;
+    limits->maxSamplerAllocationCount = 4000;
+    limits->bufferImageGranularity = 1;
+    limits->maxBoundDescriptorSets = MXGPU_VK_MAX_BOUND_SETS;
+    limits->maxPerStageDescriptorSamplers = textures;
+    limits->maxPerStageDescriptorUniformBuffers = MXGPU_VK_STAGE_UNIFORM_BUFFERS;
+    limits->maxPerStageDescriptorSampledImages = textures;
+    limits->maxPerStageResources = MXGPU_VK_STAGE_UNIFORM_BUFFERS + textures + 1;
+    limits->maxDescriptorSetSamplers = textures;
+    limits->maxDescriptorSetUniformBuffers = 2 * MXGPU_VK_STAGE_UNIFORM_BUFFERS;
+    limits->maxDescriptorSetUniformBuffersDynamic = 2 * MXGPU_VK_STAGE_UNIFORM_BUFFERS;
+    limits->maxDescriptorSetSampledImages = textures;
+    limits->maxVertexInputAttributes = 32;
+    limits->maxVertexInputBindings = 32;
+    limits->maxVertexInputAttributeOffset = UINT32_MAX;
+    limits->maxVertexInputBindingStride = UINT32_MAX;
+    limits->maxVertexOutputComponents = MXGPU_VK_INTERSTAGE_COMPONENTS;
+    limits->maxFragmentInputComponents = MXGPU_VK_INTERSTAGE_COMPONENTS;
+    limits->maxFragmentOutputAttachments = 1;
+    limits->maxFragmentCombinedOutputResources = 1;
+    limits->subPixelPrecisionBits = 4;
+    limits->subTexelPrecisionBits = 4;
+    limits->mipmapPrecisionBits = 4;
+    limits->maxDrawIndexedIndexValue = UINT32_MAX;
+    limits->maxDrawIndirectCount = 1;
+    limits->maxSamplerLodBias = 2.0f;
+    limits->maxSamplerAnisotropy = 1.0f;
+    limits->maxViewports = 1;
+    limits->maxViewportDimensions[0] = limits->maxViewportDimensions[1] = MXGPU_VK_MAX_IMAGE_DIMENSION;
+    limits->viewportBoundsRange[0] = -2.0f * MXGPU_VK_MAX_IMAGE_DIMENSION;
+    limits->viewportBoundsRange[1] = 2.0f * MXGPU_VK_MAX_IMAGE_DIMENSION - 1.0f;
+    limits->minMemoryMapAlignment = MXGPU_VK_MAP_ALIGNMENT;
+    limits->minTexelBufferOffsetAlignment = 256;
+    limits->minUniformBufferOffsetAlignment = MXGPU_VK_STORAGE_OFFSET_ALIGNMENT;
+    limits->minStorageBufferOffsetAlignment = MXGPU_VK_STORAGE_OFFSET_ALIGNMENT;
+    limits->maxFramebufferWidth = MXGPU_VK_MAX_IMAGE_DIMENSION;
+    limits->maxFramebufferHeight = MXGPU_VK_MAX_IMAGE_DIMENSION;
+    limits->maxFramebufferLayers = 1;
+    limits->framebufferColorSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    limits->framebufferDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    limits->framebufferStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    limits->maxColorAttachments = 1;
+    limits->sampledImageColorSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    limits->sampledImageIntegerSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    limits->sampledImageDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    limits->sampledImageStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    limits->storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    limits->maxSampleMaskWords = 1;
+    limits->discreteQueuePriorities = 2;
+    limits->pointSizeRange[0] = limits->pointSizeRange[1] = 1.0f;
+    limits->lineWidthRange[0] = limits->lineWidthRange[1] = 1.0f;
+    limits->optimalBufferCopyOffsetAlignment = 16;
+    limits->optimalBufferCopyRowPitchAlignment = 4;
+    limits->nonCoherentAtomSize = MXGPU_VK_MAP_ALIGNMENT;
+    if (compute) {
+        limits->maxComputeSharedMemorySize = 16384;
+        limits->maxComputeWorkGroupCount[0] = 65535;
+        limits->maxComputeWorkGroupCount[1] = 65535;
+        limits->maxComputeWorkGroupCount[2] = 65535;
+        limits->maxComputeWorkGroupInvocations = 128;
+        limits->maxComputeWorkGroupSize[0] = 128;
+        limits->maxComputeWorkGroupSize[1] = 128;
+        limits->maxComputeWorkGroupSize[2] = 64;
+        limits->maxStorageBufferRange = (uint32_t)MXGPU_VK_HEAP_BYTES;
+        limits->maxPerStageDescriptorStorageBuffers = MXGPU_SHADER_STORAGE_BUFFERS;
+        limits->maxDescriptorSetStorageBuffers = MXGPU_SHADER_STORAGE_BUFFERS;
+        limits->maxDescriptorSetStorageBuffersDynamic = MXGPU_SHADER_STORAGE_BUFFERS;
+        if (MXGPU_SHADER_STORAGE_BUFFERS + MXGPU_VK_STAGE_UNIFORM_BUFFERS > limits->maxPerStageResources)
+            limits->maxPerStageResources = MXGPU_SHADER_STORAGE_BUFFERS + MXGPU_VK_STAGE_UNIFORM_BUFFERS;
     }
 }
 
@@ -470,8 +549,11 @@ static void queue_props(VkPhysicalDevice gpu, uint32_t *count, VkQueueFamilyProp
     memset(props, 0, sizeof *props);
     props[0].queueFlags = VK_QUEUE_GRAPHICS_BIT | (vk_compute_supported() ? VK_QUEUE_COMPUTE_BIT : 0);
     props[0].queueCount = 1;
+    props[0].minImageTransferGranularity = (VkExtent3D){1, 1, 1};
     *count = 1;
 }
+
+static VkResult device_create_info_supported(VkPhysicalDevice physical, const VkDeviceCreateInfo *info);
 
 static VkResult create_device(VkPhysicalDevice gpu, const VkDeviceCreateInfo *info, const VkAllocationCallbacks *alloc, VkDevice *out)
 {
@@ -480,6 +562,8 @@ static VkResult create_device(VkPhysicalDevice gpu, const VkDeviceCreateInfo *in
     *out = VK_NULL_HANDLE;
     bool swapchain = false;
     for (uint32_t i = 0; i < info->enabledExtensionCount; i++) {
+        if (!strcmp(info->ppEnabledExtensionNames[i], VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME))
+            continue;
 #ifdef VK_USE_PLATFORM_WAYLAND_KHR
         if (!strcmp(info->ppEnabledExtensionNames[i], VK_KHR_SWAPCHAIN_EXTENSION_NAME))
             swapchain = true;
@@ -487,6 +571,9 @@ static VkResult create_device(VkPhysicalDevice gpu, const VkDeviceCreateInfo *in
 #endif
             return VK_ERROR_EXTENSION_NOT_PRESENT;
     }
+    VkResult supported = device_create_info_supported(gpu, info);
+    if (supported != VK_SUCCESS)
+        return supported;
     if (swapchain && (!gpu || !((struct mx_physical_device *)gpu)->instance ||
                       !((struct mx_physical_device *)gpu)->instance->surface_enabled))
         return VK_ERROR_EXTENSION_NOT_PRESENT;
@@ -548,7 +635,14 @@ static VkResult alloc_mem(VkDevice device, const VkMemoryAllocateInfo *info, con
     if (!mem)
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     mem->size = info->allocationSize;
-    mem->ptr = calloc(1, mem->size ? mem->size : 1);
+    if (mem->size > SIZE_MAX - (MXGPU_VK_MAP_ALIGNMENT - 1)) {
+        free(mem);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    size_t bytes = ((size_t)mem->size + MXGPU_VK_MAP_ALIGNMENT - 1) & ~(size_t)(MXGPU_VK_MAP_ALIGNMENT - 1);
+    mem->ptr = aligned_alloc(MXGPU_VK_MAP_ALIGNMENT, bytes);
+    if (mem->ptr)
+        memset(mem->ptr, 0, bytes);
     if (!mem->ptr) {
         free(mem);
         return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -2829,14 +2923,15 @@ static VkResult collect_uniforms(struct mx_cmd *cmd, unsigned stage, uint8_t **d
                 goto invalid;
             offset += dynamic_offset;
         }
-        if (range > buffer->size - offset || ref->size > range ||
+        if (range > buffer->size - offset ||
             buffer->offset > buffer->mem->size || offset > buffer->mem->size - buffer->offset)
             goto invalid;
+        VkDeviceSize bytes = ref->size <= range ? ref->size : range & ~(VkDeviceSize)3;
         memory_offset = buffer->offset + offset;
-        if (ref->size > buffer->mem->size - memory_offset ||
+        if (bytes > buffer->mem->size - memory_offset ||
             ref->offset > *size || ref->size > *size - ref->offset)
             goto invalid;
-        memcpy(*data + ref->offset, (uint8_t *)buffer->mem->ptr + memory_offset, ref->size);
+        memcpy(*data + ref->offset, (uint8_t *)buffer->mem->ptr + memory_offset, (size_t)bytes);
     }
     return VK_SUCCESS;
 invalid:
@@ -2871,7 +2966,7 @@ static VkResult storage_descriptor_range(struct mx_cmd *cmd, const struct mxgpu_
     }
     if (range == VK_WHOLE_SIZE)
         range = buffer->size - offset;
-    if (range > buffer->size - offset || range < 4 || buffer->offset > buffer->mem->size ||
+    if (range > buffer->size - offset || !range || buffer->offset > buffer->mem->size ||
         offset > buffer->mem->size - buffer->offset || range > buffer->mem->size - buffer->offset - offset ||
         (buffer->offset + offset) % 4 || buffer->mem->size > UINT32_MAX)
         return VK_ERROR_DEVICE_LOST;
@@ -2887,6 +2982,8 @@ static VkResult perform_dispatch(struct mx_draw *operation)
     struct mx_pipe *pipe = cmd->pipe;
     struct mxgpu_compute_binding bindings[MXGPU_SHADER_STORAGE_BUFFERS + 1];
     struct mx_mem *memories[MXGPU_SHADER_STORAGE_BUFFERS];
+    uint32_t scratch[MXGPU_SHADER_STORAGE_BUFFERS] = {0};
+    static const uint8_t scratch_zero[4];
     uint32_t groups[3], count = 0;
     uint8_t *uniforms = NULL;
     uint32_t uniform_bytes = 0;
@@ -2907,43 +3004,62 @@ static VkResult perform_dispatch(struct mx_draw *operation)
     for (uint32_t i = 0; i < pipe->storage_count; i++) {
         const struct mxgpu_storage_binding *ref = &pipe->storage[i];
         VkDeviceSize start, bytes;
+        uint16_t access = ref->access == MXSB_ACCESS_READ ? MXGPU_BIND_ACCESS_READ :
+                          ref->access == MXSB_ACCESS_WRITE ? MXGPU_BIND_ACCESS_WRITE : MXGPU_BIND_ACCESS_READ_WRITE;
         result = storage_descriptor_range(cmd, ref, &memories[i], &start, &bytes);
         if (result != VK_SUCCESS)
-            return result;
+            goto done;
+        if (!bytes) {
+            memories[i] = NULL;
+            result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            if (!(scratch[i] = mxgpu_storage_buffer_create(sizeof scratch_zero)))
+                goto done;
+            result = VK_ERROR_DEVICE_LOST;
+            if (mxgpu_storage_buffer_upload(scratch[i], 0, scratch_zero, sizeof scratch_zero))
+                goto done;
+            bindings[count++] = (struct mxgpu_compute_binding){(uint16_t)ref->slot, access, scratch[i], 0,
+                                                               sizeof scratch_zero};
+            continue;
+        }
         struct mx_mem *mem = memories[i];
+        result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
         if (!mem->storage && !(mem->storage = mxgpu_storage_buffer_create((uint32_t)mem->size)))
-            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            goto done;
+        result = VK_ERROR_DEVICE_LOST;
         if (mxgpu_storage_buffer_upload(mem->storage, (uint32_t)start, (const uint8_t *)mem->ptr + start, (uint32_t)bytes))
-            return VK_ERROR_DEVICE_LOST;
-        bindings[count++] = (struct mxgpu_compute_binding){
-            (uint16_t)ref->slot,
-            (uint16_t)(ref->access == MXSB_ACCESS_READ ? MXGPU_BIND_ACCESS_READ :
-                       ref->access == MXSB_ACCESS_WRITE ? MXGPU_BIND_ACCESS_WRITE : MXGPU_BIND_ACCESS_READ_WRITE),
-            mem->storage, start, bytes};
+            goto done;
+        bindings[count++] = (struct mxgpu_compute_binding){(uint16_t)ref->slot, access, mem->storage, start, bytes};
     }
     result = collect_uniforms(cmd, MXGPU_VK_COMPUTE_STAGE, &uniforms, &uniform_bytes);
     if (result != VK_SUCCESS)
-        return result;
+        goto done;
     if (uniform_bytes) {
         int uploaded = pipe->uniform_storage &&
                        !mxgpu_storage_buffer_upload(pipe->uniform_storage, 0, uniforms, uniform_bytes);
         free(uniforms);
+        result = VK_ERROR_DEVICE_LOST;
         if (!uploaded)
-            return VK_ERROR_DEVICE_LOST;
+            goto done;
         bindings[count++] = (struct mxgpu_compute_binding){
             (uint16_t)pipe->uniform_slot, MXGPU_BIND_ACCESS_READ, pipe->uniform_storage, 0, uniform_bytes};
     }
+    result = VK_ERROR_DEVICE_LOST;
     if (mxgpu_compute_dispatch(pipe->compute_pipeline, MXGPU_DISPATCH_THREADGROUPS, groups, bindings, count))
-        return VK_ERROR_DEVICE_LOST;
+        goto done;
     for (uint32_t i = 0; i < pipe->storage_count; i++) {
-        if (!(pipe->storage[i].access & MXSB_ACCESS_WRITE))
+        if (!(pipe->storage[i].access & MXSB_ACCESS_WRITE) || !memories[i])
             continue;
         uint8_t *target = (uint8_t *)memories[i]->ptr + bindings[i].offset;
         if (mxgpu_storage_buffer_read(memories[i]->storage, (uint32_t)bindings[i].offset, target,
                                       (uint32_t)bindings[i].size))
-            return VK_ERROR_DEVICE_LOST;
+            goto done;
     }
-    return VK_SUCCESS;
+    result = VK_SUCCESS;
+done:
+    for (uint32_t i = 0; i < pipe->storage_count; i++)
+        if (scratch[i])
+            mxgpu_storage_buffer_destroy(scratch[i]);
+    return result;
 }
 
 static VkResult stage_view_texture(const struct mx_view *view, const uint8_t *source,
@@ -3223,17 +3339,17 @@ static int fetch_vertex_attribute(struct mx_cmd *cmd, uint32_t binding, uint32_t
         buffer = cmd->vbo;
         base = cmd->voff;
     }
-    if (!buffer || !buffer->mem || !buffer->mem->ptr ||
-        (stride && vertex > (UINT64_MAX - attribute_offset) / stride))
+    if (!buffer || !buffer->mem || !buffer->mem->ptr || buffer->offset > buffer->mem->size ||
+        buffer->size > buffer->mem->size - buffer->offset)
         return -1;
+    if (stride && vertex > (UINT64_MAX - attribute_offset) / stride)
+        return 1;
     VkDeviceSize offset = vertex * stride + attribute_offset;
     if (base > UINT64_MAX - offset)
-        return -1;
+        return 1;
     offset += base;
-    if (offset > buffer->size || bytes > buffer->size - offset ||
-        buffer->offset > buffer->mem->size || offset > buffer->mem->size - buffer->offset ||
-        bytes > buffer->mem->size - buffer->offset - offset)
-        return -1;
+    if (offset > buffer->size || bytes > buffer->size - offset)
+        return 1;
     memcpy(destination, (uint8_t *)buffer->mem->ptr + buffer->offset + offset, bytes);
     return 0;
 }
@@ -3249,8 +3365,14 @@ static int gather_vertex(struct mx_cmd *cmd, uint64_t vertex, uint64_t instance,
     if (pipe->vertex_builtins && (pipe->vertex_builtin_slot >= slots ||
         vertex > UINT32_MAX || instance < cmd->first_instance || instance - cmd->first_instance > UINT32_MAX))
         return -1;
-    if (!pipe->vertex_layout)
-        return pipe->vertex_builtins ? -1 : fetch_vertex_attribute(cmd, 0, slots * 16, 0, vertex, slots * 16, out);
+    if (!pipe->vertex_layout) {
+        if (pipe->vertex_builtins)
+            return -1;
+        int fetched = fetch_vertex_attribute(cmd, 0, slots * 16, 0, vertex, slots * 16, out);
+        if (fetched > 0)
+            memset(out, 0, (size_t)slots * 16);
+        return fetched < 0 ? -1 : 0;
+    }
     for (uint32_t slot = 0; slot < slots; slot++) {
         float *value = out + slot * 4;
         value[0] = value[1] = value[2] = 0.f;
@@ -3274,8 +3396,11 @@ static int gather_vertex(struct mx_cmd *cmd, uint64_t vertex, uint64_t instance,
         union { uint8_t bytes[16]; uint32_t words[4]; } packed;
         unsigned stride = pipe->vertex_bindings[attribute->binding].stride;
         uint64_t element = pipe->vertex_bindings[attribute->binding].inputRate == VK_VERTEX_INPUT_RATE_INSTANCE ? instance : vertex;
-        if (fetch_vertex_attribute(cmd, attribute->binding, stride, attribute->offset, element, bytes, packed.bytes))
+        int fetched = fetch_vertex_attribute(cmd, attribute->binding, stride, attribute->offset, element, bytes, packed.bytes);
+        if (fetched < 0)
             return -1;
+        if (fetched > 0)
+            memset(packed.bytes, 0, sizeof packed.bytes);
         util_format_unpack_rgba(format, value, packed.bytes, 1);
     }
     return 0;
@@ -3357,9 +3482,7 @@ static VkResult perform_vertex_draw(struct mx_cmd *cmd)
                 }
                 for (unsigned lane = 0; lane < 3; lane++) {
                     int64_t vertex = (int64_t)indices[source[lane]] + (cmd->indexed ? cmd->vertex_bias : 0);
-                    bool fetch_attributes = cmd->pipe->vertex_attribute_count > (cmd->pipe->vertex_builtins ? 1u : 0u);
-                    if (vertex > UINT32_MAX || (vertex < 0 && (fetch_attributes || !cmd->pipe->vertex_shader)) ||
-                        gather_vertex(cmd, (uint64_t)(uint32_t)vertex, (uint64_t)cmd->first_instance + instance,
+                    if (gather_vertex(cmd, (uint64_t)(uint32_t)vertex, (uint64_t)cmd->first_instance + instance,
                                       vertices + (size_t)output * (stride_bytes / 4)))
                         goto done;
                     output++;
@@ -3962,6 +4085,22 @@ static uint32_t descriptor_index(struct mx_set *set, uint32_t binding, uint32_t 
     return UINT32_MAX;
 }
 
+static void write_descriptor(struct mx_set *set, struct mx_descriptor *descriptor, const VkDescriptorImageInfo *image,
+                             const VkDescriptorBufferInfo *buffer, const VkBufferView *texel)
+{
+    if (image) {
+        descriptor->value.image = *image;
+        if (descriptor->immutable_sampler)
+            descriptor->value.image.sampler = descriptor->immutable_sampler;
+        if (descriptor->value.image.imageView)
+            set->image = (struct mx_view *)descriptor->value.image.imageView;
+    } else if (buffer) {
+        descriptor->value.buffer = *buffer;
+    } else if (texel) {
+        descriptor->value.texel = *texel;
+    }
+}
+
 static void update_sets(VkDevice device, uint32_t count, const VkWriteDescriptorSet *writes, uint32_t copy_count, const VkCopyDescriptorSet *copies)
 {
     uint32_t i, j;
@@ -3976,17 +4115,9 @@ static void update_sets(VkDevice device, uint32_t count, const VkWriteDescriptor
             struct mx_descriptor *descriptor = &set->descriptors[at + j];
             if (descriptor->type != write->descriptorType)
                 break;
-            if (write->pImageInfo) {
-                descriptor->value.image = write->pImageInfo[j];
-                if (descriptor->immutable_sampler)
-                    descriptor->value.image.sampler = descriptor->immutable_sampler;
-                if (descriptor->value.image.imageView)
-                    set->image = (struct mx_view *)descriptor->value.image.imageView;
-            } else if (write->pBufferInfo) {
-                descriptor->value.buffer = write->pBufferInfo[j];
-            } else if (write->pTexelBufferView) {
-                descriptor->value.texel = write->pTexelBufferView[j];
-            }
+            write_descriptor(set, descriptor, write->pImageInfo ? &write->pImageInfo[j] : NULL,
+                             write->pBufferInfo ? &write->pBufferInfo[j] : NULL,
+                             write->pTexelBufferView ? &write->pTexelBufferView[j] : NULL);
         }
     }
     for (i = 0; i < copy_count; i++) {
@@ -4010,12 +4141,236 @@ static void update_sets(VkDevice device, uint32_t count, const VkWriteDescriptor
     }
 }
 
+struct mx_update_template {
+    uint32_t count;
+    VkDescriptorUpdateTemplateEntry *entries;
+};
+
+static VkResult create_update_template(VkDevice device, const VkDescriptorUpdateTemplateCreateInfo *info,
+                                       const VkAllocationCallbacks *alloc, VkDescriptorUpdateTemplate *out)
+{
+    struct mx_update_template *template;
+    (void)device;
+    (void)alloc;
+    *out = VK_NULL_HANDLE;
+    template = calloc(1, sizeof *template);
+    if (!template)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (info->descriptorUpdateEntryCount) {
+        template->entries = malloc((size_t)info->descriptorUpdateEntryCount * sizeof *template->entries);
+        if (!template->entries) {
+            free(template);
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+        memcpy(template->entries, info->pDescriptorUpdateEntries,
+               (size_t)info->descriptorUpdateEntryCount * sizeof *template->entries);
+        template->count = info->descriptorUpdateEntryCount;
+    }
+    *out = (VkDescriptorUpdateTemplate)template;
+    return VK_SUCCESS;
+}
+
+static void destroy_update_template(VkDevice device, VkDescriptorUpdateTemplate handle,
+                                    const VkAllocationCallbacks *alloc)
+{
+    struct mx_update_template *template = (struct mx_update_template *)handle;
+    (void)device;
+    (void)alloc;
+    if (template)
+        free(template->entries);
+    free(template);
+}
+
+static void update_set_with_template(VkDevice device, VkDescriptorSet handle, VkDescriptorUpdateTemplate tmpl,
+                                     const void *data)
+{
+    struct mx_set *set = (struct mx_set *)handle;
+    const struct mx_update_template *template = (const struct mx_update_template *)tmpl;
+    (void)device;
+    for (uint32_t i = 0; set && template && i < template->count; i++) {
+        const VkDescriptorUpdateTemplateEntry *entry = &template->entries[i];
+        uint32_t at = descriptor_index(set, entry->dstBinding, entry->dstArrayElement);
+        if (at == UINT32_MAX || entry->descriptorCount > set->descriptor_count - at)
+            continue;
+        for (uint32_t j = 0; j < entry->descriptorCount; j++) {
+            struct mx_descriptor *descriptor = &set->descriptors[at + j];
+            const uint8_t *source = (const uint8_t *)data + entry->offset + (size_t)j * entry->stride;
+            if (descriptor->type != entry->descriptorType)
+                break;
+            switch (entry->descriptorType) {
+            case VK_DESCRIPTOR_TYPE_SAMPLER:
+            case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+            case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+            case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+            case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT: {
+                VkDescriptorImageInfo image;
+                memcpy(&image, source, sizeof image);
+                write_descriptor(set, descriptor, &image, NULL, NULL);
+                break;
+            }
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: {
+                VkDescriptorBufferInfo buffer;
+                memcpy(&buffer, source, sizeof buffer);
+                write_descriptor(set, descriptor, NULL, &buffer, NULL);
+                break;
+            }
+            case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+            case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {
+                VkBufferView texel;
+                memcpy(&texel, source, sizeof texel);
+                write_descriptor(set, descriptor, NULL, NULL, &texel);
+                break;
+            }
+            default:
+                break;
+            }
+        }
+    }
+}
+
+struct mx_ycbcr_conversion {
+    VkSamplerYcbcrConversionCreateInfo info;
+};
+
+static VkResult create_ycbcr_conversion(VkDevice device, const VkSamplerYcbcrConversionCreateInfo *info,
+                                        const VkAllocationCallbacks *alloc, VkSamplerYcbcrConversion *out)
+{
+    struct mx_ycbcr_conversion *conversion = calloc(1, sizeof *conversion);
+    (void)device;
+    (void)alloc;
+    *out = VK_NULL_HANDLE;
+    if (!conversion)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    conversion->info = *info;
+    conversion->info.pNext = NULL;
+    *out = (VkSamplerYcbcrConversion)conversion;
+    return VK_SUCCESS;
+}
+
+static void destroy_ycbcr_conversion(VkDevice device, VkSamplerYcbcrConversion conversion,
+                                     const VkAllocationCallbacks *alloc)
+{
+    (void)device;
+    (void)alloc;
+    free(conversion);
+}
+
+static void layout_support(VkDevice device, const VkDescriptorSetLayoutCreateInfo *info,
+                           VkDescriptorSetLayoutSupport *support)
+{
+    uint64_t count = 0;
+    (void)device;
+    for (uint32_t i = 0; i < info->bindingCount; i++)
+        count += info->pBindings[i].descriptorCount;
+    support->supported = count <= UINT32_MAX && count <= SIZE_MAX / sizeof(struct mx_descriptor);
+    for (VkBaseOutStructure *next = support->pNext; next; next = next->pNext)
+        if (next->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_LAYOUT_SUPPORT)
+            ((VkDescriptorSetVariableDescriptorCountLayoutSupport *)next)->maxVariableDescriptorCount = 0;
+}
+
+static void get_queue2(VkDevice device, const VkDeviceQueueInfo2 *info, VkQueue *queue)
+{
+    if (info->flags) {
+        *queue = VK_NULL_HANDLE;
+        return;
+    }
+    get_queue(device, info->queueFamilyIndex, info->queueIndex, queue);
+}
+
+static void dedicated_requirements(void *chain)
+{
+    for (VkBaseOutStructure *next = chain; next; next = next->pNext)
+        if (next->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS) {
+            VkMemoryDedicatedRequirements *dedicated = (VkMemoryDedicatedRequirements *)next;
+            dedicated->prefersDedicatedAllocation = VK_FALSE;
+            dedicated->requiresDedicatedAllocation = VK_FALSE;
+        }
+}
+
+static void buffer_reqs2(VkDevice device, const VkBufferMemoryRequirementsInfo2 *info, VkMemoryRequirements2 *reqs)
+{
+    buffer_reqs(device, info->buffer, &reqs->memoryRequirements);
+    dedicated_requirements(reqs->pNext);
+}
+
+static void image_reqs2(VkDevice device, const VkImageMemoryRequirementsInfo2 *info, VkMemoryRequirements2 *reqs)
+{
+    image_reqs(device, info->image, &reqs->memoryRequirements);
+    dedicated_requirements(reqs->pNext);
+}
+
+static void image_sparse_reqs(VkDevice device, VkImage image, uint32_t *count,
+                              VkSparseImageMemoryRequirements *reqs)
+{
+    (void)device;
+    (void)image;
+    (void)reqs;
+    *count = 0;
+}
+
+static void image_sparse_reqs2(VkDevice device, const VkImageSparseMemoryRequirementsInfo2 *info, uint32_t *count,
+                               VkSparseImageMemoryRequirements2 *reqs)
+{
+    (void)device;
+    (void)info;
+    (void)reqs;
+    *count = 0;
+}
+
+static VkResult bind_buffer2(VkDevice device, uint32_t count, const VkBindBufferMemoryInfo *infos)
+{
+    for (uint32_t i = 0; i < count; i++) {
+        VkResult result = bind_buffer(device, infos[i].buffer, infos[i].memory, infos[i].memoryOffset);
+        if (result != VK_SUCCESS)
+            return result;
+    }
+    return VK_SUCCESS;
+}
+
+static VkResult bind_image2(VkDevice device, uint32_t count, const VkBindImageMemoryInfo *infos)
+{
+    for (uint32_t i = 0; i < count; i++) {
+        VkResult result = bind_image(device, infos[i].image, infos[i].memory, infos[i].memoryOffset);
+        if (result != VK_SUCCESS)
+            return result;
+    }
+    return VK_SUCCESS;
+}
+
+static void trim_pool(VkDevice device, VkCommandPool pool, VkCommandPoolTrimFlags flags)
+{
+    (void)device;
+    (void)pool;
+    (void)flags;
+}
+
+static void peer_memory_features(VkDevice device, uint32_t heap, uint32_t local, uint32_t remote,
+                                 VkPeerMemoryFeatureFlags *features)
+{
+    (void)device;
+    (void)heap;
+    (void)local;
+    (void)remote;
+    *features = 0;
+}
+
+static void cmd_set_device_mask(VkCommandBuffer command, uint32_t mask)
+{
+    struct mx_cmd *cmd = (struct mx_cmd *)command;
+    if (mask != 1 && cmd->record_result == VK_SUCCESS)
+        cmd->record_result = VK_ERROR_DEVICE_LOST;
+}
+
 static void mem_props(VkPhysicalDevice gpu, VkPhysicalDeviceMemoryProperties *props)
 {
     (void)gpu;
     memset(props, 0, sizeof *props);
     props->memoryTypeCount = 1;
-    props->memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    props->memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     props->memoryHeapCount = 1;
     props->memoryHeaps[0].size = MXGPU_VK_HEAP_BYTES;
     props->memoryHeaps[0].flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
@@ -4115,6 +4470,22 @@ static PFN_vkVoidFunction device_proc(const char *name)
     if (strcmp(name, "vkFreeDescriptorSets") == 0) return (PFN_vkVoidFunction)free_sets;
     if (strcmp(name, "vkResetDescriptorPool") == 0) return (PFN_vkVoidFunction)reset_pool_ds;
     if (strcmp(name, "vkUpdateDescriptorSets") == 0) return (PFN_vkVoidFunction)update_sets;
+    if (strcmp(name, "vkGetDeviceQueue2") == 0) return (PFN_vkVoidFunction)get_queue2;
+    if (strcmp(name, "vkGetBufferMemoryRequirements2") == 0) return (PFN_vkVoidFunction)buffer_reqs2;
+    if (strcmp(name, "vkGetImageMemoryRequirements2") == 0) return (PFN_vkVoidFunction)image_reqs2;
+    if (strcmp(name, "vkGetImageSparseMemoryRequirements") == 0) return (PFN_vkVoidFunction)image_sparse_reqs;
+    if (strcmp(name, "vkGetImageSparseMemoryRequirements2") == 0) return (PFN_vkVoidFunction)image_sparse_reqs2;
+    if (strcmp(name, "vkBindBufferMemory2") == 0) return (PFN_vkVoidFunction)bind_buffer2;
+    if (strcmp(name, "vkBindImageMemory2") == 0) return (PFN_vkVoidFunction)bind_image2;
+    if (strcmp(name, "vkTrimCommandPool") == 0) return (PFN_vkVoidFunction)trim_pool;
+    if (strcmp(name, "vkGetDescriptorSetLayoutSupport") == 0) return (PFN_vkVoidFunction)layout_support;
+    if (strcmp(name, "vkCmdSetDeviceMask") == 0) return (PFN_vkVoidFunction)cmd_set_device_mask;
+    if (strcmp(name, "vkGetDeviceGroupPeerMemoryFeatures") == 0) return (PFN_vkVoidFunction)peer_memory_features;
+    if (strcmp(name, "vkCreateDescriptorUpdateTemplate") == 0) return (PFN_vkVoidFunction)create_update_template;
+    if (strcmp(name, "vkDestroyDescriptorUpdateTemplate") == 0) return (PFN_vkVoidFunction)destroy_update_template;
+    if (strcmp(name, "vkUpdateDescriptorSetWithTemplate") == 0) return (PFN_vkVoidFunction)update_set_with_template;
+    if (strcmp(name, "vkCreateSamplerYcbcrConversion") == 0) return (PFN_vkVoidFunction)create_ycbcr_conversion;
+    if (strcmp(name, "vkDestroySamplerYcbcrConversion") == 0) return (PFN_vkVoidFunction)destroy_ycbcr_conversion;
     return NULL;
 }
 
@@ -4122,6 +4493,8 @@ static void device_features(VkPhysicalDevice physical, VkPhysicalDeviceFeatures 
 {
     (void)physical;
     memset(features, 0, sizeof *features);
+    features->robustBufferAccess = VK_TRUE;
+    features->fullDrawIndexUint32 = VK_TRUE;
 }
 
 static void format_properties(VkPhysicalDevice physical, VkFormat format, VkFormatProperties *properties)
@@ -4166,11 +4539,12 @@ static VkResult image_format_properties(VkPhysicalDevice physical, VkFormat form
         (tiling != VK_IMAGE_TILING_LINEAR && tiling != VK_IMAGE_TILING_OPTIMAL) || flags ||
         (usage & ~supported_usage))
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
-    properties->maxExtent = (VkExtent3D){2048, 2048, 1};
+    properties->maxExtent = (VkExtent3D){MXGPU_VK_MAX_IMAGE_DIMENSION, MXGPU_VK_MAX_IMAGE_DIMENSION, 1};
     properties->maxMipLevels = 12;
     properties->maxArrayLayers = 1;
     properties->sampleCounts = VK_SAMPLE_COUNT_1_BIT;
-    properties->maxResourceSize = (VkDeviceSize)2048 * 2048 * vk_format_bytes(format) * 2;
+    properties->maxResourceSize = (VkDeviceSize)MXGPU_VK_MAX_IMAGE_DIMENSION * MXGPU_VK_MAX_IMAGE_DIMENSION *
+                                  vk_format_bytes(format) * 2;
     return VK_SUCCESS;
 }
 
@@ -4186,6 +4560,259 @@ static void sparse_format_properties(VkPhysicalDevice physical, VkFormat format,
     (void)tiling;
     (void)properties;
     *count = 0;
+}
+
+static size_t feature_struct_size(VkStructureType type)
+{
+    switch (type) {
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES: return sizeof(VkPhysicalDeviceVulkan11Features);
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES: return sizeof(VkPhysicalDevice16BitStorageFeatures);
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES: return sizeof(VkPhysicalDeviceMultiviewFeatures);
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES: return sizeof(VkPhysicalDeviceVariablePointersFeatures);
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES: return sizeof(VkPhysicalDeviceProtectedMemoryFeatures);
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES:
+        return sizeof(VkPhysicalDeviceSamplerYcbcrConversionFeatures);
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES:
+        return sizeof(VkPhysicalDeviceShaderDrawParametersFeatures);
+    default: return 0;
+    }
+}
+
+static void device_features2(VkPhysicalDevice physical, VkPhysicalDeviceFeatures2 *features)
+{
+    device_features(physical, &features->features);
+    for (VkBaseOutStructure *next = features->pNext; next; next = next->pNext) {
+        size_t size = feature_struct_size(next->sType);
+        if (size)
+            memset((uint8_t *)next + sizeof *next, 0, size - sizeof *next);
+    }
+}
+
+static bool features_supported(VkPhysicalDevice physical, const VkPhysicalDeviceFeatures *requested)
+{
+    VkPhysicalDeviceFeatures supported;
+    const VkBool32 *want = (const VkBool32 *)requested, *have = (const VkBool32 *)&supported;
+    device_features(physical, &supported);
+    for (size_t i = 0; i < sizeof supported / sizeof(VkBool32); i++)
+        if (want[i] && !have[i])
+            return false;
+    return true;
+}
+
+static VkResult device_create_info_supported(VkPhysicalDevice physical, const VkDeviceCreateInfo *info)
+{
+    if (info->pEnabledFeatures && !features_supported(physical, info->pEnabledFeatures))
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    for (uint32_t i = 0; i < info->queueCreateInfoCount; i++)
+        if (info->pQueueCreateInfos[i].flags & VK_DEVICE_QUEUE_CREATE_PROTECTED_BIT)
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+    for (const VkBaseInStructure *next = info->pNext; next; next = next->pNext) {
+        if (next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
+            if (!features_supported(physical, &((const VkPhysicalDeviceFeatures2 *)next)->features))
+                return VK_ERROR_FEATURE_NOT_PRESENT;
+            continue;
+        }
+        if (next->sType == VK_STRUCTURE_TYPE_DEVICE_GROUP_DEVICE_CREATE_INFO) {
+            const VkDeviceGroupDeviceCreateInfo *group = (const VkDeviceGroupDeviceCreateInfo *)next;
+            if (group->physicalDeviceCount > 1 ||
+                (group->physicalDeviceCount && group->pPhysicalDevices[0] != physical))
+                return VK_ERROR_INITIALIZATION_FAILED;
+            continue;
+        }
+        size_t size = feature_struct_size(next->sType);
+        const VkBool32 *flags = (const VkBool32 *)((const uint8_t *)next + sizeof *next);
+        for (size_t i = 0; size && i < (size - sizeof *next) / sizeof(VkBool32); i++)
+            if (flags[i])
+                return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    return VK_SUCCESS;
+}
+
+static void fill_vulkan11_properties(VkPhysicalDeviceVulkan11Properties *p)
+{
+    memcpy(p->deviceUUID, mx_device_uuid, VK_UUID_SIZE);
+    memcpy(p->driverUUID, mx_driver_uuid, VK_UUID_SIZE);
+    memset(p->deviceLUID, 0, VK_LUID_SIZE);
+    p->deviceNodeMask = 0;
+    p->deviceLUIDValid = VK_FALSE;
+    p->subgroupSize = 1;
+    p->subgroupSupportedStages = 0;
+    p->subgroupSupportedOperations = 0;
+    p->subgroupQuadOperationsInAllStages = VK_FALSE;
+    p->pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_ALL_CLIP_PLANES;
+    p->maxMultiviewViewCount = 0;
+    p->maxMultiviewInstanceIndex = 0;
+    p->protectedNoFault = VK_FALSE;
+    p->maxPerSetDescriptors = MXGPU_VK_MAX_PER_SET_DESCRIPTORS;
+    p->maxMemoryAllocationSize = MXGPU_VK_HEAP_BYTES;
+}
+
+static void device_props2(VkPhysicalDevice physical, VkPhysicalDeviceProperties2 *properties)
+{
+    VkPhysicalDeviceVulkan11Properties core = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES};
+    fill_vulkan11_properties(&core);
+    device_props(physical, &properties->properties);
+    for (VkBaseOutStructure *next = properties->pNext; next; next = next->pNext) {
+        switch (next->sType) {
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES:
+            fill_vulkan11_properties((VkPhysicalDeviceVulkan11Properties *)next);
+            break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES: {
+            VkPhysicalDeviceIDProperties *p = (VkPhysicalDeviceIDProperties *)next;
+            memcpy(p->deviceUUID, core.deviceUUID, VK_UUID_SIZE);
+            memcpy(p->driverUUID, core.driverUUID, VK_UUID_SIZE);
+            memcpy(p->deviceLUID, core.deviceLUID, VK_LUID_SIZE);
+            p->deviceNodeMask = core.deviceNodeMask;
+            p->deviceLUIDValid = core.deviceLUIDValid;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES: {
+            VkPhysicalDeviceMaintenance3Properties *p = (VkPhysicalDeviceMaintenance3Properties *)next;
+            p->maxPerSetDescriptors = core.maxPerSetDescriptors;
+            p->maxMemoryAllocationSize = core.maxMemoryAllocationSize;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_PROPERTIES: {
+            VkPhysicalDeviceMultiviewProperties *p = (VkPhysicalDeviceMultiviewProperties *)next;
+            p->maxMultiviewViewCount = core.maxMultiviewViewCount;
+            p->maxMultiviewInstanceIndex = core.maxMultiviewInstanceIndex;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_POINT_CLIPPING_PROPERTIES:
+            ((VkPhysicalDevicePointClippingProperties *)next)->pointClippingBehavior = core.pointClippingBehavior;
+            break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_PROPERTIES:
+            ((VkPhysicalDeviceProtectedMemoryProperties *)next)->protectedNoFault = core.protectedNoFault;
+            break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES: {
+            VkPhysicalDeviceSubgroupProperties *p = (VkPhysicalDeviceSubgroupProperties *)next;
+            p->subgroupSize = core.subgroupSize;
+            p->supportedStages = core.subgroupSupportedStages;
+            p->supportedOperations = core.subgroupSupportedOperations;
+            p->quadOperationsInAllStages = core.subgroupQuadOperationsInAllStages;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES: {
+            VkPhysicalDeviceDriverProperties *p = (VkPhysicalDeviceDriverProperties *)next;
+            p->driverID = MXGPU_VK_DRIVER_ID;
+            snprintf(p->driverName, sizeof p->driverName, "MXGPU");
+            snprintf(p->driverInfo, sizeof p->driverInfo, "MXGPU Vulkan %s", MXGPU_DRIVER_VERSION);
+            p->conformanceVersion = (VkConformanceVersion){0, 0, 0, 0};
+            break;
+        }
+        default:
+            break;
+        }
+    }
+}
+
+static void queue_props2(VkPhysicalDevice gpu, uint32_t *count, VkQueueFamilyProperties2 *props)
+{
+    if (!props) {
+        queue_props(gpu, count, NULL);
+        return;
+    }
+    if (!*count)
+        return;
+    queue_props(gpu, count, &props[0].queueFamilyProperties);
+}
+
+static void mem_props2(VkPhysicalDevice gpu, VkPhysicalDeviceMemoryProperties2 *props)
+{
+    mem_props(gpu, &props->memoryProperties);
+}
+
+static void format_properties2(VkPhysicalDevice physical, VkFormat format, VkFormatProperties2 *properties)
+{
+    format_properties(physical, format, &properties->formatProperties);
+}
+
+static VkResult image_format_properties2(VkPhysicalDevice physical, const VkPhysicalDeviceImageFormatInfo2 *info,
+                                        VkImageFormatProperties2 *properties)
+{
+    bool external = false;
+    for (const VkBaseInStructure *next = info->pNext; next; next = next->pNext)
+        if (next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO &&
+            ((const VkPhysicalDeviceExternalImageFormatInfo *)next)->handleType)
+            external = true;
+    VkResult result = image_format_properties(physical, info->format, info->type, info->tiling, info->usage,
+                                              info->flags, &properties->imageFormatProperties);
+    for (VkBaseOutStructure *next = properties->pNext; next; next = next->pNext) {
+        if (next->sType == VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES)
+            memset(&((VkExternalImageFormatProperties *)next)->externalMemoryProperties, 0,
+                   sizeof(VkExternalMemoryProperties));
+        else if (next->sType == VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES)
+            ((VkSamplerYcbcrConversionImageFormatProperties *)next)->combinedImageSamplerDescriptorCount = 1;
+    }
+    if (result == VK_SUCCESS && external) {
+        memset(&properties->imageFormatProperties, 0, sizeof properties->imageFormatProperties);
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+    return result;
+}
+
+static void sparse_format_properties2(VkPhysicalDevice physical, const VkPhysicalDeviceSparseImageFormatInfo2 *info,
+                                      uint32_t *count, VkSparseImageFormatProperties2 *properties)
+{
+    (void)physical;
+    (void)info;
+    (void)properties;
+    *count = 0;
+}
+
+static void external_buffer_properties(VkPhysicalDevice physical, const VkPhysicalDeviceExternalBufferInfo *info,
+                                       VkExternalBufferProperties *properties)
+{
+    (void)physical;
+    (void)info;
+    memset(&properties->externalMemoryProperties, 0, sizeof properties->externalMemoryProperties);
+}
+
+static void external_fence_properties(VkPhysicalDevice physical, const VkPhysicalDeviceExternalFenceInfo *info,
+                                      VkExternalFenceProperties *properties)
+{
+    (void)physical;
+    (void)info;
+    properties->exportFromImportedHandleTypes = 0;
+    properties->compatibleHandleTypes = 0;
+    properties->externalFenceFeatures = 0;
+}
+
+static void external_semaphore_properties(VkPhysicalDevice physical, const VkPhysicalDeviceExternalSemaphoreInfo *info,
+                                          VkExternalSemaphoreProperties *properties)
+{
+    (void)physical;
+    (void)info;
+    properties->exportFromImportedHandleTypes = 0;
+    properties->compatibleHandleTypes = 0;
+    properties->externalSemaphoreFeatures = 0;
+}
+
+static VkResult enum_device_groups(VkInstance instance, uint32_t *count, VkPhysicalDeviceGroupProperties *groups)
+{
+    struct mx_instance *owner = (struct mx_instance *)instance;
+    uint32_t available = mxgpu_device_available() ? 1 : 0;
+    if (!count)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    if (!groups) {
+        *count = available;
+        return VK_SUCCESS;
+    }
+    uint32_t written = *count < available ? *count : available;
+    for (uint32_t i = 0; i < written; i++) {
+        groups[i].physicalDeviceCount = 1;
+        memset(groups[i].physicalDevices, 0, sizeof groups[i].physicalDevices);
+        groups[i].physicalDevices[0] = (VkPhysicalDevice)&owner->physical;
+        groups[i].subsetAllocation = VK_FALSE;
+    }
+    *count = written;
+    return written < available ? VK_INCOMPLETE : VK_SUCCESS;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL enumerate_instance_version(uint32_t *version)
+{
+    *version = MXGPU_VK_API_VERSION;
+    return VK_SUCCESS;
 }
 
 static VkResult instance_extensions(const char *layer, uint32_t *count, VkExtensionProperties *properties)
@@ -4212,26 +4839,27 @@ static VkResult instance_extensions(const char *layer, uint32_t *count, VkExtens
 #endif
 }
 
+static const VkExtensionProperties mx_device_extensions[] = {
+    {VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME, VK_KHR_DRIVER_PROPERTIES_SPEC_VERSION},
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
+    {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_SWAPCHAIN_SPEC_VERSION},
+#endif
+};
+
 static VkResult device_extensions(VkPhysicalDevice physical, const char *layer, uint32_t *count, VkExtensionProperties *properties)
 {
+    const uint32_t total = sizeof mx_device_extensions / sizeof mx_device_extensions[0];
     (void)physical;
     if (layer)
         return VK_ERROR_LAYER_NOT_PRESENT;
-#ifdef VK_USE_PLATFORM_WAYLAND_KHR
     if (!properties) {
-        *count = 1;
+        *count = total;
         return VK_SUCCESS;
     }
-    if (!*count)
-        return VK_INCOMPLETE;
-    properties[0] = (VkExtensionProperties){VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_SWAPCHAIN_SPEC_VERSION};
-    *count = 1;
-    return VK_SUCCESS;
-#else
-    (void)properties;
-    *count = 0;
-    return VK_SUCCESS;
-#endif
+    uint32_t written = *count < total ? *count : total;
+    memcpy(properties, mx_device_extensions, written * sizeof *properties);
+    *count = written;
+    return written < total ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device_proc(VkDevice device, const char *name)
@@ -4270,6 +4898,22 @@ static PFN_vkVoidFunction instance_proc(const char *name)
     if (strcmp(name, "vkGetPhysicalDeviceMemoryProperties") == 0) return (PFN_vkVoidFunction)mem_props;
     if (strcmp(name, "vkCreateDevice") == 0) return (PFN_vkVoidFunction)create_device;
     if (strcmp(name, "vkGetDeviceProcAddr") == 0) return (PFN_vkVoidFunction)get_device_proc;
+    if (strcmp(name, "vkEnumerateInstanceVersion") == 0) return (PFN_vkVoidFunction)enumerate_instance_version;
+    if (strcmp(name, "vkEnumeratePhysicalDeviceGroups") == 0) return (PFN_vkVoidFunction)enum_device_groups;
+    if (strcmp(name, "vkGetPhysicalDeviceFeatures2") == 0) return (PFN_vkVoidFunction)device_features2;
+    if (strcmp(name, "vkGetPhysicalDeviceProperties2") == 0) return (PFN_vkVoidFunction)device_props2;
+    if (strcmp(name, "vkGetPhysicalDeviceFormatProperties2") == 0) return (PFN_vkVoidFunction)format_properties2;
+    if (strcmp(name, "vkGetPhysicalDeviceImageFormatProperties2") == 0) return (PFN_vkVoidFunction)image_format_properties2;
+    if (strcmp(name, "vkGetPhysicalDeviceQueueFamilyProperties2") == 0) return (PFN_vkVoidFunction)queue_props2;
+    if (strcmp(name, "vkGetPhysicalDeviceMemoryProperties2") == 0) return (PFN_vkVoidFunction)mem_props2;
+    if (strcmp(name, "vkGetPhysicalDeviceSparseImageFormatProperties2") == 0)
+        return (PFN_vkVoidFunction)sparse_format_properties2;
+    if (strcmp(name, "vkGetPhysicalDeviceExternalBufferProperties") == 0)
+        return (PFN_vkVoidFunction)external_buffer_properties;
+    if (strcmp(name, "vkGetPhysicalDeviceExternalFenceProperties") == 0)
+        return (PFN_vkVoidFunction)external_fence_properties;
+    if (strcmp(name, "vkGetPhysicalDeviceExternalSemaphoreProperties") == 0)
+        return (PFN_vkVoidFunction)external_semaphore_properties;
     dev = device_proc(name);
     return dev;
 }
