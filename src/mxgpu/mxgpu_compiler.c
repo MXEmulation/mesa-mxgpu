@@ -40,6 +40,12 @@ struct mx_low {
     struct mx_descriptor_ref descriptors[MX_LOW_DEFS];
     unsigned uniform_buffer_count;
     struct mxgpu_uniform_buffer uniform_buffers[MXGPU_UNIFORM_BUFFERS];
+    bool compute;
+    nir_block *predicate_block;
+    unsigned predicate;
+    unsigned storage_count;
+    struct mxgpu_storage_binding storage[MXGPU_SHADER_STORAGE_BUFFERS];
+    unsigned workgroup_bytes;
 };
 
 static unsigned low_id(struct mx_low *low)
@@ -56,8 +62,11 @@ static void low_emit(struct mx_low *low, const uint32_t *words, unsigned count)
         low->fail = 1;
         return;
     }
-    if (count >= 3 && (words[0] & 0xffffu) != MXSB_OP_STAGE_OUTPUT &&
-        (words[0] & 0xffffu) != MXSB_OP_RETURN_VALUE && words[1] < MX_LOW_IDS)
+    uint32_t opcode = words[0] & 0xffffu;
+    if (count >= 3 && opcode != MXSB_OP_STAGE_OUTPUT && opcode != MXSB_OP_RETURN_VALUE &&
+        opcode != MXSB_OP_BUFFER_STORE && opcode != MXSB_OP_TEXTURE_STORE &&
+        opcode != MXSB_OP_WORKGROUP_STORE && opcode != MXSB_OP_WORKGROUP_ATOMIC_STORE &&
+        opcode != MXSB_OP_BUFFER_ATOMIC_STORE && words[1] < MX_LOW_IDS)
         low->id_type[words[1]] = words[2];
     memcpy(low->words[low->count], words, count * sizeof(uint32_t));
     low->lens[low->count] = count;
@@ -666,6 +675,51 @@ static void low_alu(struct mx_low *low, nir_alu_instr *alu)
         low_finish_vec(low, alu, ids, comps);
         return;
     }
+    if (alu->def.bit_size == 32 && (alu->op == nir_op_umin || alu->op == nir_op_umax ||
+                                    alu->op == nir_op_imin || alu->op == nir_op_imax)) {
+        bool lesser = alu->op == nir_op_umin || alu->op == nir_op_imin;
+        bool sign = alu->op == nir_op_imin || alu->op == nir_op_imax;
+        for (i = 0; i < comps; i++) {
+            unsigned left = low_lane(low, alu, 0, i);
+            unsigned right = low_lane(low, alu, 1, i);
+            unsigned a = left, b = right;
+            if (sign) {
+                unsigned bias = low_u32(low, 0x80000000u);
+                a = low_binop_ty(low, MXSB_OP_BIT_XOR, MXSB_TYPE_U32, left, bias);
+                b = low_binop_ty(low, MXSB_OP_BIT_XOR, MXSB_TYPE_U32, right, bias);
+            }
+            unsigned below = low_cmp(low, MXSB_OP_LT, a, b);
+            ids[i] = low_select(low, MXSB_TYPE_U32, below, lesser ? left : right, lesser ? right : left);
+        }
+        low_finish_lanes(low, alu->def.index, ids, comps);
+        return;
+    }
+    if (alu->def.bit_size == 32 && (alu->op == nir_op_udiv || alu->op == nir_op_umod ||
+                                    alu->op == nir_op_idiv || alu->op == nir_op_irem)) {
+        bool sign = alu->op == nir_op_idiv || alu->op == nir_op_irem;
+        uint16_t opcode = alu->op == nir_op_udiv || alu->op == nir_op_idiv ? MXSB_OP_IDIV : MXSB_OP_IMOD;
+        for (i = 0; i < comps; i++) {
+            unsigned left = low_lane(low, alu, 0, i);
+            unsigned right = low_lane(low, alu, 1, i);
+            if (sign) {
+                left = low_unop_ty(low, MXSB_OP_BITCAST, MXSB_TYPE_I32, left);
+                right = low_unop_ty(low, MXSB_OP_BITCAST, MXSB_TYPE_I32, right);
+                ids[i] = low_unop_ty(low, MXSB_OP_BITCAST, MXSB_TYPE_U32,
+                                     low_binop_ty(low, opcode, MXSB_TYPE_I32, left, right));
+            } else {
+                ids[i] = low_binop_ty(low, opcode, MXSB_TYPE_U32, left, right);
+            }
+        }
+        low_finish_lanes(low, alu->def.index, ids, comps);
+        return;
+    }
+    if (alu->def.bit_size == 32 && alu->src[0].src.ssa->bit_size == 32 &&
+        (alu->op == nir_op_u2u32 || alu->op == nir_op_i2i32)) {
+        for (i = 0; i < comps; i++)
+            ids[i] = low_lane(low, alu, 0, i);
+        low_finish_lanes(low, alu->def.index, ids, comps);
+        return;
+    }
     if (alu->op == nir_op_fadd) bin = MXSB_OP_ADD;
     else if (alu->op == nir_op_fsub) bin = MXSB_OP_SUB;
     else if (alu->op == nir_op_fmul) bin = MXSB_OP_MUL;
@@ -999,7 +1053,319 @@ static int low_phi_merge(struct mx_low *low, nir_phi_instr *phi, nir_block *bloc
     return 0;
 }
 
-static int low_shader(const nir_shader *nir, int fragment, struct mx_low *low)
+static unsigned low_block_predicate(struct mx_low *low, nir_block *block)
+{
+    nir_cf_node *child = &block->cf_node;
+    unsigned predicate = 0;
+    if (low->predicate_block == block)
+        return low->predicate;
+    for (nir_cf_node *parent = child->parent; parent && !low->fail; child = parent, parent = parent->parent) {
+        if (parent->type == nir_cf_node_loop) {
+            low->fail = 1;
+            return 0;
+        }
+        if (parent->type != nir_cf_node_if)
+            continue;
+        nir_if *nif = nir_cf_node_as_if(parent);
+        unsigned cond = low_component(low, nif->condition.ssa, 0);
+        if (cond && low->id_type[cond] != MXSB_TYPE_BOOL)
+            cond = low_unop_ty(low, MXSB_OP_NOT, MXSB_TYPE_BOOL,
+                               low_cmp(low, MXSB_OP_EQ, low_cast(low, cond, MXSB_TYPE_U32), low_u32(low, 0)));
+        if (!cf_list_contains(&nif->then_list, child))
+            cond = low_unop_ty(low, MXSB_OP_NOT, MXSB_TYPE_BOOL, cond);
+        predicate = predicate ? low_select(low, MXSB_TYPE_BOOL, predicate, cond, low_bool(low, 0)) : cond;
+    }
+    low->predicate_block = block;
+    low->predicate = predicate;
+    return predicate;
+}
+
+static unsigned low_guarded_index(struct mx_low *low, nir_block *block, unsigned index)
+{
+    unsigned predicate = low_block_predicate(low, block);
+    if (!predicate)
+        return index;
+    return low_select(low, MXSB_TYPE_U32, predicate, index, low_u32(low, UINT32_MAX));
+}
+
+static unsigned low_word_index(struct mx_low *low, unsigned byte, unsigned extra_words)
+{
+    unsigned word = low_binop_ty(low, MXSB_OP_SHR, MXSB_TYPE_U32, low_cast(low, byte, MXSB_TYPE_U32), low_u32(low, 2));
+    return extra_words ? low_binop_ty(low, MXSB_OP_ADD, MXSB_TYPE_U32, word, low_u32(low, extra_words)) : word;
+}
+
+static unsigned low_storage_binding(struct mx_low *low, const struct mx_descriptor_ref *ref, unsigned access)
+{
+    for (unsigned i = 0; i < low->storage_count; i++) {
+        struct mxgpu_storage_binding *b = &low->storage[i];
+        if (b->set == ref->set && b->binding == ref->binding && b->element == ref->element) {
+            b->access |= access;
+            return b->binding_id;
+        }
+    }
+    if (low->storage_count >= MXGPU_SHADER_STORAGE_BUFFERS) {
+        low->fail = 1;
+        return 0;
+    }
+    struct mxgpu_storage_binding *b = &low->storage[low->storage_count];
+    *b = (struct mxgpu_storage_binding){ref->set, ref->binding, ref->element,
+                                        MXGPU_COMPUTE_UNIFORM_BINDING + 1 + low->storage_count,
+                                        low->storage_count, access};
+    low->storage_count++;
+    return b->binding_id;
+}
+
+static int low_ssbo_address(struct mx_low *low, nir_deref_instr *deref, unsigned access,
+                            unsigned *binding_id, unsigned *byte)
+{
+    uint64_t constant = 0;
+    unsigned dynamic = 0;
+    nir_deref_instr *cursor = deref;
+    while (cursor && cursor->deref_type != nir_deref_type_cast) {
+        nir_deref_instr *parent = nir_deref_instr_parent(cursor);
+        if (!parent || !parent->type)
+            return -1;
+        if (glsl_type_is_matrix(parent->type) && glsl_matrix_type_is_row_major(parent->type))
+            return -1;
+        if (cursor->deref_type == nir_deref_type_struct) {
+            int field = glsl_get_struct_field_offset(parent->type, cursor->strct.index);
+            if (field < 0 || (field & 3))
+                return -1;
+            constant += (unsigned)field;
+        } else if (cursor->deref_type == nir_deref_type_array || cursor->deref_type == nir_deref_type_ptr_as_array) {
+            unsigned stride = nir_deref_instr_array_stride(cursor);
+            nir_def *index = cursor->arr.index.ssa;
+            if (!stride || (stride & 3) || !index)
+                return -1;
+            if (nir_src_is_const(cursor->arr.index)) {
+                constant += (uint64_t)nir_src_as_uint(cursor->arr.index) * stride;
+            } else {
+                if (index->bit_size != 32 || index->index >= MX_LOW_DEFS || !low->id_of[index->index])
+                    return -1;
+                unsigned term = low_binop_ty(low, MXSB_OP_MUL, MXSB_TYPE_U32,
+                                             low_cast(low, low_component(low, index, 0), MXSB_TYPE_U32),
+                                             low_u32(low, stride));
+                dynamic = dynamic ? low_binop_ty(low, MXSB_OP_ADD, MXSB_TYPE_U32, dynamic, term) : term;
+            }
+        } else {
+            return -1;
+        }
+        if (constant > UINT32_MAX)
+            return -1;
+        cursor = parent;
+    }
+    if (!cursor || !(cursor->modes & nir_var_mem_ssbo) || !cursor->parent.ssa ||
+        cursor->parent.ssa->index >= MX_LOW_DEFS || !low->descriptors[cursor->parent.ssa->index].valid)
+        return -1;
+    *binding_id = low_storage_binding(low, &low->descriptors[cursor->parent.ssa->index], access);
+    *byte = dynamic ? (constant ? low_binop_ty(low, MXSB_OP_ADD, MXSB_TYPE_U32, dynamic, low_u32(low, (uint32_t)constant)) : dynamic)
+                    : low_u32(low, (uint32_t)constant);
+    return low->fail ? -1 : 0;
+}
+
+static bool low_atomic_opcodes(nir_atomic_op op, uint16_t *buffer, uint16_t *workgroup)
+{
+    *buffer = *workgroup = 0;
+    switch (op) {
+    case nir_atomic_op_iadd: *buffer = MXSB_OP_BUFFER_ATOMIC_ADD; *workgroup = MXSB_OP_WORKGROUP_ATOMIC_ADD; break;
+    case nir_atomic_op_isub: *buffer = MXSB_OP_BUFFER_ATOMIC_SUBTRACT; break;
+    case nir_atomic_op_umin: *buffer = MXSB_OP_BUFFER_ATOMIC_MINIMUM; break;
+    case nir_atomic_op_umax: *buffer = MXSB_OP_BUFFER_ATOMIC_MAXIMUM; break;
+    case nir_atomic_op_iand: *buffer = MXSB_OP_BUFFER_ATOMIC_AND; break;
+    case nir_atomic_op_ior: *buffer = MXSB_OP_BUFFER_ATOMIC_OR; break;
+    case nir_atomic_op_ixor: *buffer = MXSB_OP_BUFFER_ATOMIC_XOR; break;
+    case nir_atomic_op_xchg: *buffer = MXSB_OP_BUFFER_ATOMIC_EXCHANGE; *workgroup = MXSB_OP_WORKGROUP_ATOMIC_EXCHANGE; break;
+    case nir_atomic_op_cmpxchg: *buffer = MXSB_OP_BUFFER_ATOMIC_COMPARE_EXCHANGE; *workgroup = MXSB_OP_WORKGROUP_ATOMIC_COMPARE_EXCHANGE; break;
+    default: return false;
+    }
+    return true;
+}
+
+static void low_compute_builtin(struct mx_low *low, nir_intrinsic_instr *intr, uint32_t builtin, bool vector)
+{
+    unsigned comps = intr->def.num_components, ids[3];
+    if (intr->def.bit_size != 32 || !comps || comps > (vector ? 3u : 1u)) {
+        low->fail = 1;
+        return;
+    }
+    uint32_t rec[5] = {(4u << 16) | MXSB_OP_BUILTIN, low_id(low), vector ? MXSB_TYPE_U32X3 : MXSB_TYPE_U32, builtin};
+    low_emit(low, rec, 4);
+    if (!vector) {
+        low_remember(low, intr->def.index, rec[1], 1);
+        return;
+    }
+    for (unsigned lane = 0; lane < comps; lane++) {
+        uint32_t extract[5] = {(5u << 16) | MXSB_OP_EXTRACT, low_id(low), MXSB_TYPE_U32, rec[1], lane};
+        low_emit(low, extract, 5);
+        ids[lane] = extract[1];
+    }
+    low_finish_lanes(low, intr->def.index, ids, comps);
+}
+
+static unsigned low_shared_index(struct mx_low *low, nir_intrinsic_instr *intr, unsigned offset_src)
+{
+    nir_def *offset = intr->src[offset_src].ssa;
+    if (!offset || offset->bit_size != 32 || (nir_intrinsic_has_align_mul(intr) && nir_intrinsic_align(intr) < 4) ||
+        (nir_intrinsic_base(intr) & 3))
+        return 0;
+    if (nir_src_is_const(intr->src[offset_src])) {
+        uint64_t byte = (uint64_t)nir_src_as_uint(intr->src[offset_src]) + (unsigned)nir_intrinsic_base(intr);
+        return byte > UINT32_MAX || (byte & 3) ? 0 : low_u32(low, (uint32_t)(byte / 4));
+    }
+    return low_word_index(low, low_component(low, offset, 0), (unsigned)nir_intrinsic_base(intr) / 4);
+}
+
+static int low_compute_intrinsic(struct mx_low *low, nir_intrinsic_instr *intr, nir_block *block)
+{
+    nir_intrinsic_op op = intr->intrinsic;
+    bool has_dest = nir_intrinsic_infos[op].has_dest;
+    if (has_dest && intr->def.index >= MX_LOW_DEFS)
+        return low->fail = 1;
+    switch (op) {
+    case nir_intrinsic_load_global_invocation_id:
+        low_compute_builtin(low, intr, MXSB_BUILTIN_GLOBAL_INVOCATION_ID, true);
+        return 1;
+    case nir_intrinsic_load_local_invocation_id:
+        low_compute_builtin(low, intr, MXSB_BUILTIN_LOCAL_INVOCATION_ID, true);
+        return 1;
+    case nir_intrinsic_load_workgroup_id:
+        low_compute_builtin(low, intr, MXSB_BUILTIN_WORKGROUP_ID, true);
+        return 1;
+    case nir_intrinsic_load_num_workgroups:
+        low_compute_builtin(low, intr, MXSB_BUILTIN_NUM_WORKGROUPS, true);
+        return 1;
+    case nir_intrinsic_load_workgroup_size:
+        low_compute_builtin(low, intr, MXSB_BUILTIN_WORKGROUP_SIZE, true);
+        return 1;
+    case nir_intrinsic_load_local_invocation_index:
+        low_compute_builtin(low, intr, MXSB_BUILTIN_LOCAL_INVOCATION_INDEX, false);
+        return 1;
+    case nir_intrinsic_load_base_global_invocation_id:
+    case nir_intrinsic_load_base_workgroup_id: {
+        unsigned comps = intr->def.num_components, ids[3];
+        if (intr->def.bit_size != 32 || !comps || comps > 3)
+            return low->fail = 1;
+        for (unsigned lane = 0; lane < comps; lane++)
+            ids[lane] = low_u32(low, 0);
+        low_finish_lanes(low, intr->def.index, ids, comps);
+        return 1;
+    }
+    case nir_intrinsic_barrier: {
+        mesa_scope execution = nir_intrinsic_execution_scope(intr);
+        mesa_scope memory = nir_intrinsic_memory_scope(intr);
+        nir_variable_mode modes = nir_intrinsic_memory_modes(intr);
+        uint32_t device = (1u << 16) | MXSB_OP_DEVICE_MEMORY_BARRIER;
+        uint32_t control = (1u << 16) | MXSB_OP_CONTROL_BARRIER;
+        uint32_t fence = (1u << 16) | MXSB_OP_MEMORY_BARRIER;
+        if (memory != SCOPE_NONE && (modes & (nir_var_mem_ssbo | nir_var_mem_global | nir_var_image)))
+            low_emit(low, &device, 1);
+        if (execution != SCOPE_NONE)
+            low_emit(low, &control, 1);
+        else if (memory != SCOPE_NONE && (modes & nir_var_mem_shared))
+            low_emit(low, &fence, 1);
+        return 1;
+    }
+    case nir_intrinsic_load_shared:
+    case nir_intrinsic_store_shared:
+    case nir_intrinsic_shared_atomic:
+    case nir_intrinsic_shared_atomic_swap: {
+        bool store = op == nir_intrinsic_store_shared;
+        unsigned value_bits = store ? intr->src[0].ssa->bit_size : intr->def.bit_size;
+        unsigned comps = store ? intr->src[0].ssa->num_components : intr->def.num_components;
+        unsigned index = low_shared_index(low, intr, store ? 1 : 0), ids[4];
+        if (!index || value_bits != 32 || !comps || comps > 4 || !low->workgroup_bytes)
+            return low->fail = 1;
+        if (op == nir_intrinsic_load_shared) {
+            for (unsigned lane = 0; lane < comps; lane++) {
+                unsigned at = lane ? low_binop_ty(low, MXSB_OP_ADD, MXSB_TYPE_U32, index, low_u32(low, lane)) : index;
+                uint32_t rec[5] = {(5u << 16) | MXSB_OP_WORKGROUP_LOAD, low_id(low), MXSB_TYPE_U32, 0, at};
+                low_emit(low, rec, 5);
+                ids[lane] = rec[1];
+            }
+            low_finish_lanes(low, intr->def.index, ids, comps);
+        } else if (store) {
+            unsigned mask = nir_intrinsic_write_mask(intr);
+            for (unsigned lane = 0; lane < comps; lane++) {
+                if (!(mask & (1u << lane)))
+                    continue;
+                unsigned at = lane ? low_binop_ty(low, MXSB_OP_ADD, MXSB_TYPE_U32, index, low_u32(low, lane)) : index;
+                uint32_t rec[5] = {(5u << 16) | MXSB_OP_WORKGROUP_STORE, MXSB_TYPE_U32, 0,
+                                   low_guarded_index(low, block, at),
+                                   low_cast(low, low_component(low, intr->src[0].ssa, lane), MXSB_TYPE_U32)};
+                low_emit(low, rec, 5);
+            }
+        } else {
+            uint16_t buffer_op, workgroup_op;
+            bool swap = op == nir_intrinsic_shared_atomic_swap;
+            if (comps != 1 || !low_atomic_opcodes(nir_intrinsic_atomic_op(intr), &buffer_op, &workgroup_op) || !workgroup_op)
+                return low->fail = 1;
+            uint32_t rec[7] = {((swap ? 7u : 6u) << 16) | workgroup_op, 0, MXSB_TYPE_U32, 0,
+                               low_guarded_index(low, block, index),
+                               low_cast(low, low_component(low, intr->src[1].ssa, 0), MXSB_TYPE_U32)};
+            if (swap)
+                rec[6] = low_cast(low, low_component(low, intr->src[2].ssa, 0), MXSB_TYPE_U32);
+            rec[1] = low_id(low);
+            low_emit(low, rec, swap ? 7 : 6);
+            low_remember(low, intr->def.index, rec[1], 1);
+        }
+        return 1;
+    }
+    case nir_intrinsic_load_deref:
+    case nir_intrinsic_store_deref:
+    case nir_intrinsic_deref_atomic:
+    case nir_intrinsic_deref_atomic_swap: {
+        nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+        bool store = op == nir_intrinsic_store_deref, load = op == nir_intrinsic_load_deref;
+        unsigned binding = 0, byte = 0, ids[4];
+        if (!deref || !(deref->modes & nir_var_mem_ssbo))
+            return 0;
+        nir_def *value = store ? intr->src[1].ssa : &intr->def;
+        unsigned comps = value->num_components;
+        if (value->bit_size != 32 || !comps || comps > 4 ||
+            low_ssbo_address(low, deref, load ? MXSB_ACCESS_READ : store ? MXSB_ACCESS_WRITE : MXSB_ACCESS_READ_WRITE,
+                             &binding, &byte))
+            return low->fail = 1;
+        unsigned index = low_word_index(low, byte, 0);
+        if (load) {
+            for (unsigned lane = 0; lane < comps; lane++) {
+                unsigned at = lane ? low_binop_ty(low, MXSB_OP_ADD, MXSB_TYPE_U32, index, low_u32(low, lane)) : index;
+                uint32_t rec[5] = {(5u << 16) | MXSB_OP_BUFFER_LOAD, low_id(low), MXSB_TYPE_U32, binding, at};
+                low_emit(low, rec, 5);
+                ids[lane] = rec[1];
+            }
+            low_finish_lanes(low, intr->def.index, ids, comps);
+        } else if (store) {
+            unsigned mask = nir_intrinsic_write_mask(intr);
+            for (unsigned lane = 0; lane < comps; lane++) {
+                if (!(mask & (1u << lane)))
+                    continue;
+                unsigned at = lane ? low_binop_ty(low, MXSB_OP_ADD, MXSB_TYPE_U32, index, low_u32(low, lane)) : index;
+                uint32_t rec[4] = {(4u << 16) | MXSB_OP_BUFFER_STORE, binding, low_guarded_index(low, block, at),
+                                   low_cast(low, low_component(low, value, lane), MXSB_TYPE_U32)};
+                low_emit(low, rec, 4);
+            }
+        } else {
+            uint16_t buffer_op, workgroup_op;
+            bool swap = op == nir_intrinsic_deref_atomic_swap;
+            if (comps != 1 || !low_atomic_opcodes(nir_intrinsic_atomic_op(intr), &buffer_op, &workgroup_op))
+                return low->fail = 1;
+            uint32_t rec[7] = {((swap ? 7u : 6u) << 16) | buffer_op, 0, MXSB_TYPE_U32, binding,
+                               low_guarded_index(low, block, index),
+                               low_cast(low, low_component(low, intr->src[1].ssa, 0), MXSB_TYPE_U32)};
+            if (swap)
+                rec[6] = low_cast(low, low_component(low, intr->src[2].ssa, 0), MXSB_TYPE_U32);
+            rec[1] = low_id(low);
+            low_emit(low, rec, swap ? 7 : 6);
+            low_remember(low, intr->def.index, rec[1], 1);
+        }
+        return 1;
+    }
+    default:
+        return 0;
+    }
+}
+
+static int low_shader(const nir_shader *nir, int fragment, bool compute, struct mx_low *low)
 {
     nir_function_impl *impl = nir_shader_get_entrypoint((nir_shader *)nir);
     unsigned ret_id = 0;
@@ -1010,9 +1376,10 @@ static int low_shader(const nir_shader *nir, int fragment, struct mx_low *low)
     nir_index_ssa_defs(impl);
     memset(low, 0, sizeof *low);
     low->next = 1;
-    low->uniform_binding = fragment ? 4 : 3;
+    low->compute = compute;
+    low->uniform_binding = compute ? MXGPU_COMPUTE_UNIFORM_BINDING : fragment ? 4 : 3;
     low->uniform_count = nir->num_uniforms;
-    if (!fragment) {
+    if (!fragment && !compute) {
         for (unsigned i = 0; i < MXGPU_SHADER_VERTEX_SLOTS; i++)
             low->vertex_input_locations[i] = UINT32_MAX;
         nir_foreach_variable_with_modes(var, nir, nir_var_shader_in) {
@@ -1026,7 +1393,7 @@ static int low_shader(const nir_shader *nir, int fragment, struct mx_low *low)
                 low->vertex_attribute_count = end;
         }
     }
-    if (!fragment) {
+    if (!fragment && !compute) {
         nir_foreach_block(block, impl) {
             nir_foreach_instr(instr, block) {
                 if (instr->type != nir_instr_type_intrinsic)
@@ -1121,6 +1488,20 @@ static int low_shader(const nir_shader *nir, int fragment, struct mx_low *low)
                                               .push_constant_words = push_words};
         low->uniform_count += slots;
     }
+    if (compute) {
+        nir_foreach_block(block, impl) {
+            for (nir_cf_node *parent = block->cf_node.parent; parent; parent = parent->parent)
+                if (parent->type == nir_cf_node_loop)
+                    return -1;
+        }
+        if (nir->info.shared_size) {
+            if (nir->info.shared_size > UINT32_MAX - 3u)
+                return -1;
+            low->workgroup_bytes = (nir->info.shared_size + 3u) & ~3u;
+            uint32_t rec[2] = {(2u << 16) | MXSB_OP_WORKGROUP_MEMORY, low->workgroup_bytes};
+            low_emit(low, rec, 2);
+        }
+    }
     nir_foreach_block(block, impl) {
         int leave_block = 0;
         if (stop)
@@ -1139,7 +1520,8 @@ static int low_shader(const nir_shader *nir, int fragment, struct mx_low *low)
                 low_alu(low, nir_instr_as_alu(instr));
             } else if (instr->type == nir_instr_type_intrinsic) {
                 nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-                if (intr->intrinsic == nir_intrinsic_load_ubo || intr->intrinsic == nir_intrinsic_load_push_constant) {
+                if (compute && low_compute_intrinsic(low, intr, block)) {
+                } else if (intr->intrinsic == nir_intrinsic_load_ubo || intr->intrinsic == nir_intrinsic_load_push_constant) {
                     low->fail = low_gl_ubo_load(low, intr) != 0;
                 } else if (intr->intrinsic == nir_intrinsic_load_vertex_id ||
                     intr->intrinsic == nir_intrinsic_load_vertex_id_zero_base ||
@@ -1652,14 +2034,19 @@ static int low_shader(const nir_shader *nir, int fragment, struct mx_low *low)
                         distinct = 2;
                     }
                 }
-                if (distinct == 1)
-                    low_remember(low, phi->def.index, low->id_of[defined->index],
-                                 low->comps[defined->index] ? low->comps[defined->index] : defined->num_components);
+                if (distinct == 1) {
+                    unsigned comps = low->comps[defined->index] ? low->comps[defined->index] : defined->num_components;
+                    low_remember(low, phi->def.index, low->id_of[defined->index], comps);
+                    if (comps > 1)
+                        low_keep_comps(low, phi->def.index, low->comp_id[defined->index], comps);
+                }
                 else if (!low_phi_merge(low, phi, block))
                     low->fail = 1;
             } else if (instr->type == nir_instr_type_jump) {
                 nir_jump_instr *jump = nir_instr_as_jump(instr);
-                if (jump->type == nir_jump_return || jump->type == nir_jump_halt || jump->type == nir_jump_abort) {
+                if (compute && block->cf_node.parent != &impl->cf_node) {
+                    low->fail = 1;
+                } else if (jump->type == nir_jump_return || jump->type == nir_jump_halt || jump->type == nir_jump_abort) {
                     stop = 1;
                     leave_block = 1;
                 } else if (jump->type == nir_jump_break || jump->type == nir_jump_continue) {
@@ -1760,6 +2147,12 @@ static int low_shader(const nir_shader *nir, int fragment, struct mx_low *low)
         rec[1] = ret_id;
         low_emit(low, rec, 2);
     }
+    if (compute) {
+        uint32_t rec = (1u << 16) | MXSB_OP_RETURN_VOID;
+        if (partial_return)
+            return -1;
+        low_emit(low, &rec, 1);
+    }
     return low->fail || low->count == 0 ? -1 : 0;
 }
 
@@ -1854,6 +2247,46 @@ int mxgpu_link_shaders_draw_samplers(const struct mxgpu_shader *vs, const struct
     return mxsb_writer_finish(&writer, out, cap, out_len) == MXSB_OK ? 0 : -1;
 }
 
+int mxgpu_link_compute(const struct mxgpu_shader *cs, uint8_t *out, uint32_t cap, uint32_t *out_len)
+{
+    struct mxsb_writer writer;
+    struct mxsb_limits limits;
+    const uint32_t *records[MX_LOW_INSNS];
+    uint32_t capacity = MXGPU_LINK_MODULE_CAPACITY / 4u;
+    int result = -1;
+    if (!cs || !cs->compute || !cs->count || cs->count > MX_LOW_INSNS || !out || !out_len ||
+        cs->storage_count > MXGPU_SHADER_STORAGE_BUFFERS ||
+        !cs->workgroup_size[0] || !cs->workgroup_size[1] || !cs->workgroup_size[2])
+        return -1;
+    uint32_t *words = malloc(capacity * sizeof *words);
+    if (!words || mxsb_writer_init(&writer, words, capacity, MXSB_VERSION_MINOR) != MXSB_OK)
+        goto done;
+    for (unsigned i = 0; i < cs->storage_count; i++) {
+        const struct mxgpu_storage_binding *b = &cs->storage[i];
+        if (mxsb_writer_binding(&writer, b->binding_id, (uint16_t)b->slot, MXSB_BINDING_STORAGE, b->access,
+                                MXSB_TYPE_U32, 1) != MXSB_OK)
+            goto done;
+    }
+    if (cs->uses_uniforms &&
+        (!cs->uniform_count || mxsb_writer_binding(&writer, MXGPU_COMPUTE_UNIFORM_BINDING, (uint16_t)cs->uniform_slot,
+                                                   MXSB_BINDING_STORAGE, MXSB_ACCESS_READ, MXSB_TYPE_F32X4,
+                                                   cs->uniform_count) != MXSB_OK))
+        goto done;
+    if (mxsb_writer_entry_workgroup(&writer, 1, MXSB_STAGE_COMPUTE, 1, cs->workgroup_size[0],
+                                    cs->workgroup_size[1], cs->workgroup_size[2]) != MXSB_OK)
+        goto done;
+    for (unsigned i = 0; i < cs->count; i++)
+        records[i] = cs->words[i];
+    if (mxsb_writer_block(&writer, 1, 1, records, cs->lens, cs->count) != MXSB_OK ||
+        mxsb_writer_finish(&writer, out, cap, out_len) != MXSB_OK ||
+        mxsb_limits_default(&limits) != MXSB_OK || mxsb_verify(out, *out_len, &limits) != MXSB_OK)
+        goto done;
+    result = 0;
+done:
+    free(words);
+    return result;
+}
+
 int mxgpu_link_shaders_draw(const struct mxgpu_shader *vs, const struct mxgpu_shader *fs, unsigned vertex_count, bool bound_sampler, uint8_t *out, uint32_t cap, uint32_t *out_len)
 {
     return mxgpu_link_shaders_draw_samplers(vs, fs, vertex_count, bound_sampler, out, cap, out_len, NULL);
@@ -1877,17 +2310,49 @@ static bool shader_samples(const struct nir_shader *nir)
     return nir && nir->info.num_textures;
 }
 
+static void compute_lower(nir_shader *nir)
+{
+    nir_opt_peephole_select_options sel = {.limit = ~0u, .indirect_load_ok = true, .expensive_alu_ok = true};
+    bool progress;
+    unsigned rounds = 0;
+    nir_lower_returns(nir);
+    nir_lower_vars_to_explicit_types(nir, nir_var_mem_shared, glsl_get_natural_size_align_bytes);
+    nir_lower_explicit_io(nir, nir_var_mem_shared, nir_address_format_32bit_offset);
+    nir_lower_system_values(nir);
+    do {
+        progress = false;
+        progress |= nir_opt_copy_prop(nir);
+        progress |= nir_opt_dce(nir);
+        progress |= nir_opt_cse(nir);
+        progress |= nir_opt_constant_folding(nir);
+        progress |= nir_opt_remove_phis(nir);
+        progress |= nir_opt_dead_cf(nir);
+        progress |= nir_opt_loop_unroll(nir);
+        progress |= nir_opt_peephole_select(nir, &sel);
+    } while (progress && ++rounds < 32);
+}
+
 int mxgpu_compile_nir(struct nir_shader *nir, bool fragment, struct mxgpu_shader *shader)
 {
+    static const nir_shader_compiler_options compute_options = {.max_unroll_iterations = 64};
     if (!nir || !shader)
         return -1;
     memset(shader, 0, sizeof *shader);
+    bool compute = nir->info.stage == MESA_SHADER_COMPUTE;
+    if (compute && (fragment || nir->info.workgroup_size_variable))
+        return -1;
     nir_shader_compiler_options default_options = {0};
     const nir_shader_compiler_options *options = nir->options;
-    if (!nir->options)
+    if (compute) {
+        nir->options = &compute_options;
+        compute_lower(nir);
+    } else if (!nir->options) {
         nir->options = &default_options;
+    }
     nir_lower_system_values(nir);
-    nir->options = options;
+    if (!compute) {
+        nir->options = options;
+    }
         struct mx_low low;
         nir_opt_peephole_select_options sel;
         memset(&sel, 0, sizeof sel);
@@ -1904,7 +2369,9 @@ int mxgpu_compile_nir(struct nir_shader *nir, bool fragment, struct mxgpu_shader
         nir_opt_undef(nir);
         nir_opt_constant_folding(nir);
         nir_opt_dce(nir);
-        if (low_shader(nir, fragment, &low) == 0 && low.count <= MX_LOW_INSNS) {
+        int lowered = low_shader(nir, fragment, compute, &low);
+        nir->options = options;
+        if (lowered == 0 && low.count <= MX_LOW_INSNS) {
             unsigned i;
             shader->count = low.count;
             shader->vertex_attribute_count = low.vertex_attribute_count;
@@ -1921,6 +2388,15 @@ int mxgpu_compile_nir(struct nir_shader *nir, bool fragment, struct mxgpu_shader
             shader->uniform_count = low.uniform_count;
             shader->uniform_buffer_count = low.uniform_buffer_count;
             memcpy(shader->uniform_buffers, low.uniform_buffers, sizeof shader->uniform_buffers);
+            shader->compute = compute;
+            if (compute) {
+                for (i = 0; i < 3; i++)
+                    shader->workgroup_size[i] = nir->info.workgroup_size[i];
+                shader->workgroup_bytes = low.workgroup_bytes;
+                shader->storage_count = low.storage_count;
+                shader->uniform_slot = low.storage_count;
+                memcpy(shader->storage, low.storage, sizeof shader->storage);
+            }
             for (i = 0; i < low.count; i++) {
                 memcpy(shader->words[i], low.words[i], sizeof low.words[i]);
                 shader->lens[i] = low.lens[i];

@@ -61,9 +61,11 @@ if get_option('mxgpu-tests')
                  include_directories : include_directories('.'),
                  link_with : mxgpu_vk_impl, dependencies : mxgpu_vk_deps)
     endforeach
-    executable('cs_smoke', files('cs_smoke.c'),
-               include_directories : include_directories('.'),
-               link_with : mxgpu_vk_impl, dependencies : mxgpu_vk_deps)
+    foreach validation : ['cs_smoke', 'vk_compute']
+      executable(validation, files(validation + '.c'),
+                 include_directories : include_directories('.'),
+                 link_with : mxgpu_vk_impl, dependencies : mxgpu_vk_deps)
+    endforeach
     vulkan_loader = dependency('vulkan')
     foreach validation : ['vk_client', 'vk_system']
       executable(validation, files(validation + '.c', 'vk_frame.c') + scene_shaders,

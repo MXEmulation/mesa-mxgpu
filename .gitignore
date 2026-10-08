@@ -17,3 +17,4 @@
 /src/mxgpu/vk_client
 /src/mxgpu/egl_instancing
 /src/mxgpu/cs_smoke
+/src/mxgpu/vk_compute

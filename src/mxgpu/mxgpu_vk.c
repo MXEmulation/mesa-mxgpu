@@ -18,6 +18,10 @@
 
 #define MX_EXPORT __attribute__((visibility("default")))
 #define MXGPU_VK_PUSH_CONSTANT_BYTES 128u
+#define MXGPU_VK_HEAP_BYTES (64ull << 20)
+#define MXGPU_VK_STAGES 3u
+#define MXGPU_VK_COMPUTE_STAGE 2u
+#define MXGPU_VK_STORAGE_OFFSET_ALIGNMENT 16u
 static const uint8_t mx_pipeline_cache_uuid[VK_UUID_SIZE] = {
     'M', 'X', 'G', 'P', 'U', '-', 'S', 'P', 'I', 'R', 'V', '-', '0', '0', '0', '1'
 };
@@ -28,6 +32,7 @@ struct mx_mem {
     VkDeviceSize size;
     void *ptr;
     int mapped;
+    uint32_t storage;
 };
 
 struct mx_buf {
@@ -99,9 +104,15 @@ struct mx_pipe {
     uint32_t texture_binding;
     uint32_t texture_set;
     uint32_t texture_element;
-    struct mx_uniform_stage uniform_stages[2];
+    struct mx_uniform_stage uniform_stages[MXGPU_VK_STAGES];
     uint8_t *bytes;
     uint32_t len;
+    bool compute;
+    uint32_t compute_pipeline;
+    uint32_t uniform_storage;
+    uint32_t uniform_slot;
+    uint32_t storage_count;
+    struct mxgpu_storage_binding storage[MXGPU_SHADER_STORAGE_BUFFERS];
 };
 
 struct mx_fb {
@@ -227,8 +238,12 @@ struct mx_cmd {
     struct mx_draw *draws;
     struct mx_draw *last_draw;
     VkResult record_result;
-    uint8_t push_constants[2][MXGPU_VK_PUSH_CONSTANT_BYTES];
-    struct mx_pipeline_layout *push_layouts[2][MXGPU_VK_PUSH_CONSTANT_BYTES / 4];
+    uint8_t push_constants[MXGPU_VK_STAGES][MXGPU_VK_PUSH_CONSTANT_BYTES];
+    struct mx_pipeline_layout *push_layouts[MXGPU_VK_STAGES][MXGPU_VK_PUSH_CONSTANT_BYTES / 4];
+    struct mx_pipe *compute_pipe;
+    struct mx_set **compute_sets;
+    struct mx_bound_offsets *compute_offsets;
+    uint32_t compute_set_count;
     int draw;
     int open;
     int clear;
@@ -257,12 +272,15 @@ struct mx_draw {
     VkBufferImageCopy image_region;
     struct mx_buf *copy_src, *copy_dst;
     VkBufferCopy copy_region;
+    uint32_t dispatch[3];
+    struct mx_buf *indirect;
+    VkDeviceSize indirect_offset;
     struct mx_draw *next;
 };
 
 static void release_push_layouts(struct mx_cmd *cmd)
 {
-    for (unsigned stage = 0; stage < 2; stage++)
+    for (unsigned stage = 0; stage < MXGPU_VK_STAGES; stage++)
         for (unsigned word = 0; word < MXGPU_VK_PUSH_CONSTANT_BYTES / 4; word++)
             release_layout(cmd->push_layouts[stage][word]);
 }
@@ -274,6 +292,15 @@ static void free_bound_offsets(struct mx_bound_offsets *offsets, uint32_t count)
     for (uint32_t i = 0; i < count; i++)
         free(offsets[i].values);
     free(offsets);
+}
+
+static void free_bound_state(struct mx_cmd *cmd)
+{
+    free_bound_offsets(cmd->bound_offsets, cmd->bound_set_count);
+    free(cmd->bound_sets);
+    free_bound_offsets(cmd->compute_offsets, cmd->compute_set_count);
+    free(cmd->compute_sets);
+    release_push_layouts(cmd);
 }
 
 static void free_draws(struct mx_cmd *cmd)
@@ -392,6 +419,11 @@ static VkResult enum_devices(VkInstance instance, uint32_t *count, VkPhysicalDev
     return VK_SUCCESS;
 }
 
+static bool vk_compute_supported(void)
+{
+    return mxgpu_device_open() == 0 && mxgpu_compute_available();
+}
+
 static void device_props(VkPhysicalDevice gpu, VkPhysicalDeviceProperties *props)
 {
     (void)gpu;
@@ -409,6 +441,21 @@ static void device_props(VkPhysicalDevice gpu, VkPhysicalDeviceProperties *props
     props->limits.maxVertexInputAttributeOffset = UINT32_MAX;
     props->limits.maxVertexInputBindingStride = UINT32_MAX;
     props->limits.maxPushConstantsSize = MXGPU_VK_PUSH_CONSTANT_BYTES;
+    if (vk_compute_supported()) {
+        props->limits.maxComputeSharedMemorySize = 16384;
+        props->limits.maxComputeWorkGroupCount[0] = 65535;
+        props->limits.maxComputeWorkGroupCount[1] = 65535;
+        props->limits.maxComputeWorkGroupCount[2] = 65535;
+        props->limits.maxComputeWorkGroupInvocations = 128;
+        props->limits.maxComputeWorkGroupSize[0] = 128;
+        props->limits.maxComputeWorkGroupSize[1] = 128;
+        props->limits.maxComputeWorkGroupSize[2] = 64;
+        props->limits.maxStorageBufferRange = (uint32_t)MXGPU_VK_HEAP_BYTES;
+        props->limits.minStorageBufferOffsetAlignment = MXGPU_VK_STORAGE_OFFSET_ALIGNMENT;
+        props->limits.maxPerStageDescriptorStorageBuffers = MXGPU_SHADER_STORAGE_BUFFERS;
+        props->limits.maxDescriptorSetStorageBuffers = MXGPU_SHADER_STORAGE_BUFFERS;
+        props->limits.maxDescriptorSetStorageBuffersDynamic = MXGPU_SHADER_STORAGE_BUFFERS;
+    }
 }
 
 static void queue_props(VkPhysicalDevice gpu, uint32_t *count, VkQueueFamilyProperties *props)
@@ -421,7 +468,7 @@ static void queue_props(VkPhysicalDevice gpu, uint32_t *count, VkQueueFamilyProp
     if (!*count)
         return;
     memset(props, 0, sizeof *props);
-    props[0].queueFlags = VK_QUEUE_GRAPHICS_BIT;
+    props[0].queueFlags = VK_QUEUE_GRAPHICS_BIT | (vk_compute_supported() ? VK_QUEUE_COMPUTE_BIT : 0);
     props[0].queueCount = 1;
     *count = 1;
 }
@@ -551,6 +598,8 @@ static void free_mem(VkDevice device, VkDeviceMemory memory, const VkAllocationC
     (void)alloc;
     if (!mem)
         return;
+    if (mem->storage)
+        mxgpu_storage_buffer_destroy(mem->storage);
     free(mem->ptr);
     free(mem);
 }
@@ -1018,7 +1067,8 @@ static int compile_spirv_stage(const VkPipelineShaderStageCreateInfo *stage, str
     nir_shader *nir;
     int result;
     uint32_t i;
-    mesa_shader_stage mesa_stage = stage->stage == VK_SHADER_STAGE_VERTEX_BIT ? MESA_SHADER_VERTEX : MESA_SHADER_FRAGMENT;
+    mesa_shader_stage mesa_stage = stage->stage == VK_SHADER_STAGE_VERTEX_BIT ? MESA_SHADER_VERTEX :
+                                   stage->stage == VK_SHADER_STAGE_COMPUTE_BIT ? MESA_SHADER_COMPUTE : MESA_SHADER_FRAGMENT;
     if (!shader || !shader->spirv || !stage->pName)
         return -1;
     if (stage->pSpecializationInfo) {
@@ -1245,7 +1295,8 @@ static VkResult cache_import_entry(struct mx_pipeline_cache *cache,
     uint32_t count = cache_read_u32(key + 16), data_size = cache_read_u32(key + 20);
     uint64_t required = 24ull + shader_size + name_size + 12ull * count + data_size;
     if (required != size || !shader_size || (shader_size & 3) || !name_size ||
-        (stage_kind != VK_SHADER_STAGE_VERTEX_BIT && stage_kind != VK_SHADER_STAGE_FRAGMENT_BIT))
+        (stage_kind != VK_SHADER_STAGE_VERTEX_BIT && stage_kind != VK_SHADER_STAGE_FRAGMENT_BIT &&
+         stage_kind != VK_SHADER_STAGE_COMPUTE_BIT))
         return VK_ERROR_INVALID_SHADER_NV;
     const uint8_t *name = key + 24 + shader_size;
     if (name[name_size - 1] || memchr(name, 0, name_size - 1))
@@ -1753,12 +1804,95 @@ unsupported_vertex:
     return result;
 }
 
+static VkResult create_compute_pipeline(struct mx_pipeline_cache *cache, const VkComputePipelineCreateInfo *info,
+                                        struct mx_pipe **out)
+{
+    struct mx_shader *module = (struct mx_shader *)info->stage.module;
+    struct mxgpu_shader *compiled = NULL;
+    uint8_t *bytes = NULL;
+    uint32_t len = 0;
+    VkResult result = VK_ERROR_INVALID_SHADER_NV;
+    *out = NULL;
+    if (!vk_compute_supported())
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    if (info->stage.stage != VK_SHADER_STAGE_COMPUTE_BIT || !module || !module->spirv || !info->layout)
+        return VK_ERROR_INVALID_SHADER_NV;
+    struct mx_pipe *pipe = calloc(1, sizeof *pipe);
+    compiled = malloc(sizeof *compiled);
+    bytes = malloc(MXGPU_LINK_MODULE_CAPACITY);
+    if (!pipe || !compiled || !bytes) {
+        result = VK_ERROR_OUT_OF_HOST_MEMORY;
+        goto fail;
+    }
+    if (cached_spirv_stage(cache, &info->stage, compiled) || !compiled->compute ||
+        mxgpu_link_compute(compiled, bytes, MXGPU_LINK_MODULE_CAPACITY, &len))
+        goto fail;
+    struct mx_uniform_stage *uniforms = &pipe->uniform_stages[MXGPU_VK_COMPUTE_STAGE];
+    uniforms->uses_uniforms = compiled->uses_uniforms;
+    uniforms->uniform_count = compiled->uniform_count;
+    uniforms->uniform_buffer_count = compiled->uniform_buffer_count;
+    memcpy(uniforms->uniform_buffers, compiled->uniform_buffers, sizeof uniforms->uniform_buffers);
+    pipe->storage_count = compiled->storage_count;
+    memcpy(pipe->storage, compiled->storage, sizeof pipe->storage);
+    pipe->uniform_slot = compiled->uniform_slot;
+    pipe->compute = true;
+    result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (uniforms->uses_uniforms &&
+        (!uniforms->uniform_count || uniforms->uniform_count > UINT32_MAX / 16 ||
+         !(pipe->uniform_storage = mxgpu_storage_buffer_create(uniforms->uniform_count * 16))))
+        goto fail;
+    pipe->compute_pipeline = mxgpu_compute_pipeline_create(bytes, len, 1);
+    if (!pipe->compute_pipeline)
+        goto fail;
+    pipe->layout = (struct mx_pipeline_layout *)info->layout;
+    retain_layout(pipe->layout);
+    free(compiled);
+    free(bytes);
+    *out = pipe;
+    return VK_SUCCESS;
+fail:
+    if (pipe && pipe->uniform_storage)
+        mxgpu_storage_buffer_destroy(pipe->uniform_storage);
+    free(pipe);
+    free(compiled);
+    free(bytes);
+    return result;
+}
+
+static VkResult create_compute_pipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
+                                         const VkComputePipelineCreateInfo *info,
+                                         const VkAllocationCallbacks *alloc, VkPipeline *out)
+{
+    VkResult result = VK_SUCCESS;
+    (void)device;
+    (void)alloc;
+    for (uint32_t index = 0; index < count; index++)
+        out[index] = VK_NULL_HANDLE;
+    for (uint32_t index = 0; index < count; index++) {
+        struct mx_pipe *pipe;
+        VkResult created = create_compute_pipeline((struct mx_pipeline_cache *)cache, &info[index], &pipe);
+        if (created == VK_SUCCESS) {
+            out[index] = (VkPipeline)pipe;
+            continue;
+        }
+        result = created;
+        if (created == VK_ERROR_OUT_OF_HOST_MEMORY ||
+            (info[index].flags & VK_PIPELINE_CREATE_EARLY_RETURN_ON_FAILURE_BIT))
+            return result;
+    }
+    return result;
+}
+
 static void destroy_pipeline(VkDevice device, VkPipeline pipeline, const VkAllocationCallbacks *alloc)
 {
     struct mx_pipe *pipe = (struct mx_pipe *)pipeline;
     (void)device;
     (void)alloc;
     if (pipe) {
+        if (pipe->compute_pipeline)
+            mxgpu_compute_pipeline_destroy(pipe->compute_pipeline);
+        if (pipe->uniform_storage)
+            mxgpu_storage_buffer_destroy(pipe->uniform_storage);
         free(pipe->vertex_shader);
         free(pipe->fragment_shader);
         free(pipe->bytes);
@@ -1826,9 +1960,7 @@ static void destroy_pool(VkDevice device, VkCommandPool pool, const VkAllocation
         struct mx_cmd *cmd = owner->commands;
         owner->commands = cmd->next;
         free_draws(cmd);
-        free_bound_offsets(cmd->bound_offsets, cmd->bound_set_count);
-        free(cmd->bound_sets);
-        release_push_layouts(cmd);
+        free_bound_state(cmd);
         free(cmd);
     }
     free(owner);
@@ -1847,9 +1979,7 @@ static void free_cmds(VkDevice device, VkCommandPool pool, uint32_t count, const
         if (*link) {
             *link = cmd->next;
             free_draws(cmd);
-            free_bound_offsets(cmd->bound_offsets, cmd->bound_set_count);
-            free(cmd->bound_sets);
-            release_push_layouts(cmd);
+            free_bound_state(cmd);
             free(cmd);
         }
     }
@@ -1886,9 +2016,7 @@ static VkResult reset_cmd(VkCommandBuffer command, VkCommandBufferResetFlags fla
     struct mx_cmd *next = cmd->next;
     (void)flags;
     free_draws(cmd);
-    free_bound_offsets(cmd->bound_offsets, cmd->bound_set_count);
-    free(cmd->bound_sets);
-    release_push_layouts(cmd);
+    free_bound_state(cmd);
     memset(cmd, 0, sizeof *cmd);
     cmd->loader_data = loader_data;
     cmd->pool = pool;
@@ -1965,8 +2093,16 @@ static void cmd_end_rp(VkCommandBuffer command)
 static void cmd_bind_pipe(VkCommandBuffer command, VkPipelineBindPoint point, VkPipeline pipeline)
 {
     struct mx_cmd *cmd = (struct mx_cmd *)command;
-    (void)point;
-    cmd->pipe = (struct mx_pipe *)pipeline;
+    struct mx_pipe *pipe = (struct mx_pipe *)pipeline;
+    if (point == VK_PIPELINE_BIND_POINT_COMPUTE) {
+        if (pipe && !pipe->compute)
+            cmd->record_result = VK_ERROR_DEVICE_LOST;
+        cmd->compute_pipe = pipe;
+        return;
+    }
+    if (pipe && pipe->compute)
+        cmd->record_result = VK_ERROR_DEVICE_LOST;
+    cmd->pipe = pipe;
 }
 
 static void cmd_set_viewport(VkCommandBuffer command, uint32_t first, uint32_t count, const VkViewport *viewports)
@@ -2109,8 +2245,9 @@ static void cmd_push_constants(VkCommandBuffer command, VkPipelineLayout handle,
             cmd->record_result = VK_ERROR_DEVICE_LOST;
             return;
         }
-    const VkShaderStageFlagBits stage_bits[2] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT};
-    for (unsigned stage = 0; stage < 2; stage++) {
+    const VkShaderStageFlagBits stage_bits[MXGPU_VK_STAGES] = {
+        VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_COMPUTE_BIT};
+    for (unsigned stage = 0; stage < MXGPU_VK_STAGES; stage++) {
         if (!(stages & stage_bits[stage]))
             continue;
         memcpy(cmd->push_constants[stage] + offset, values, size);
@@ -2129,7 +2266,10 @@ static void cmd_bind_sets(VkCommandBuffer command, VkPipelineBindPoint point, Vk
     struct mx_bound_offsets *offsets;
     const struct mx_pipeline_layout *owner = (const struct mx_pipeline_layout *)layout;
     uint32_t i, needed, used = 0;
-    (void)point;
+    bool compute = point == VK_PIPELINE_BIND_POINT_COMPUTE;
+    struct mx_set ***bound_field = compute ? &cmd->compute_sets : &cmd->bound_sets;
+    struct mx_bound_offsets **offsets_field = compute ? &cmd->compute_offsets : &cmd->bound_offsets;
+    uint32_t *count_field = compute ? &cmd->compute_set_count : &cmd->bound_set_count;
     if (!count || !sets || cmd->record_result != VK_SUCCESS)
         return;
     if (owner) {
@@ -2160,7 +2300,7 @@ static void cmd_bind_sets(VkCommandBuffer command, VkPipelineBindPoint point, Vk
         cmd->record_result = VK_ERROR_OUT_OF_HOST_MEMORY;
         return;
     }
-    needed = first + count > cmd->bound_set_count ? first + count : cmd->bound_set_count;
+    needed = first + count > *count_field ? first + count : *count_field;
     bound = calloc(needed, sizeof *bound);
     offsets = calloc(needed, sizeof *offsets);
     if (!bound || !offsets) {
@@ -2169,10 +2309,10 @@ static void cmd_bind_sets(VkCommandBuffer command, VkPipelineBindPoint point, Vk
         cmd->record_result = VK_ERROR_OUT_OF_HOST_MEMORY;
         return;
     }
-    if (cmd->bound_set_count) {
-        memcpy(bound, cmd->bound_sets, (size_t)cmd->bound_set_count * sizeof *bound);
-        if (cmd->bound_offsets)
-            memcpy(offsets, cmd->bound_offsets, (size_t)cmd->bound_set_count * sizeof *offsets);
+    if (*count_field) {
+        memcpy(bound, *bound_field, (size_t)*count_field * sizeof *bound);
+        if (*offsets_field)
+            memcpy(offsets, *offsets_field, (size_t)*count_field * sizeof *offsets);
     }
     for (i = first; i < first + count; i++)
         offsets[i] = (struct mx_bound_offsets){0};
@@ -2204,14 +2344,15 @@ static void cmd_bind_sets(VkCommandBuffer command, VkPipelineBindPoint point, Vk
         cmd->record_result = VK_ERROR_DEVICE_LOST;
         goto fail;
     }
-    for (i = first; cmd->bound_offsets && i < first + count && i < cmd->bound_set_count; i++)
-        free(cmd->bound_offsets[i].values);
-    free(cmd->bound_offsets);
-    free(cmd->bound_sets);
-    cmd->bound_sets = bound;
-    cmd->bound_offsets = offsets;
-    cmd->bound_set_count = needed;
-    cmd->set = cmd->bound_sets[0];
+    for (i = first; *offsets_field && i < first + count && i < *count_field; i++)
+        free((*offsets_field)[i].values);
+    free(*offsets_field);
+    free(*bound_field);
+    *bound_field = bound;
+    *offsets_field = offsets;
+    *count_field = needed;
+    if (!compute)
+        cmd->set = cmd->bound_sets[0];
     return;
 fail:
     for (i = first; i < first + count; i++)
@@ -2220,55 +2361,48 @@ fail:
     free(bound);
 }
 
-static void cmd_draw(VkCommandBuffer command, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance)
+static struct mx_draw *record_snapshot(struct mx_cmd *cmd, struct mx_set **sets,
+                                       const struct mx_bound_offsets *offsets, uint32_t set_count)
 {
-    struct mx_cmd *cmd = (struct mx_cmd *)command;
-    struct mx_draw *draw;
-    if (!vertex_count || !instance_count || cmd->record_result != VK_SUCCESS)
-        return;
-    draw = calloc(1, sizeof *draw);
+    struct mx_draw *draw = calloc(1, sizeof *draw);
     if (!draw) {
         cmd->record_result = VK_ERROR_OUT_OF_HOST_MEMORY;
-        return;
+        return NULL;
     }
-    cmd->vertex_count = vertex_count;
-    cmd->indexed = 0;
-    cmd->first_vertex = first_vertex;
-    cmd->instance_count = instance_count;
-    cmd->first_instance = first_instance;
-    cmd->draw = 1;
     draw->state = *cmd;
     draw->state.bound_sets = NULL;
     draw->state.bound_offsets = NULL;
-    if (cmd->bound_set_count) {
-        draw->state.bound_sets = malloc((size_t)cmd->bound_set_count * sizeof *cmd->bound_sets);
+    draw->state.bound_set_count = set_count;
+    draw->state.compute_sets = NULL;
+    draw->state.compute_offsets = NULL;
+    draw->state.compute_set_count = 0;
+    if (set_count) {
+        draw->state.bound_sets = malloc((size_t)set_count * sizeof *sets);
         if (!draw->state.bound_sets) {
             free(draw);
             cmd->record_result = VK_ERROR_OUT_OF_HOST_MEMORY;
-            return;
+            return NULL;
         }
-        memcpy(draw->state.bound_sets, cmd->bound_sets,
-               (size_t)cmd->bound_set_count * sizeof *cmd->bound_sets);
+        memcpy(draw->state.bound_sets, sets, (size_t)set_count * sizeof *sets);
     }
-    if (cmd->bound_offsets) {
-        draw->state.bound_offsets = calloc(cmd->bound_set_count, sizeof *cmd->bound_offsets);
+    if (offsets) {
+        draw->state.bound_offsets = calloc(set_count, sizeof *offsets);
         if (!draw->state.bound_offsets)
             goto snapshot_fail;
-        for (uint32_t i = 0; i < cmd->bound_set_count; i++) {
-            uint32_t count = cmd->bound_offsets[i].count;
+        for (uint32_t i = 0; i < set_count; i++) {
+            uint32_t count = offsets[i].count;
             if (!count)
                 continue;
             draw->state.bound_offsets[i].values = malloc((size_t)count * sizeof(uint32_t));
             if (!draw->state.bound_offsets[i].values)
                 goto snapshot_fail;
             draw->state.bound_offsets[i].count = count;
-            memcpy(draw->state.bound_offsets[i].values, cmd->bound_offsets[i].values,
-                   (size_t)count * sizeof(uint32_t));
+            memcpy(draw->state.bound_offsets[i].values, offsets[i].values, (size_t)count * sizeof(uint32_t));
         }
     }
     draw->state.draws = NULL;
     draw->state.last_draw = NULL;
-    for (unsigned stage = 0; stage < 2; stage++)
+    for (unsigned stage = 0; stage < MXGPU_VK_STAGES; stage++)
         for (unsigned word = 0; word < MXGPU_VK_PUSH_CONSTANT_BYTES / 4; word++)
             retain_layout(draw->state.push_layouts[stage][word]);
     if (cmd->last_draw)
@@ -2276,12 +2410,86 @@ static void cmd_draw(VkCommandBuffer command, uint32_t vertex_count, uint32_t in
     else
         cmd->draws = draw;
     cmd->last_draw = draw;
-    return;
+    return draw;
 snapshot_fail:
-    free_bound_offsets(draw->state.bound_offsets, cmd->bound_set_count);
+    free_bound_offsets(draw->state.bound_offsets, set_count);
     free(draw->state.bound_sets);
     free(draw);
     cmd->record_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+    return NULL;
+}
+
+static void cmd_draw(VkCommandBuffer command, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance)
+{
+    struct mx_cmd *cmd = (struct mx_cmd *)command;
+    if (!vertex_count || !instance_count || cmd->record_result != VK_SUCCESS)
+        return;
+    cmd->vertex_count = vertex_count;
+    cmd->indexed = 0;
+    cmd->first_vertex = first_vertex;
+    cmd->instance_count = instance_count;
+    cmd->first_instance = first_instance;
+    cmd->draw = 1;
+    record_snapshot(cmd, cmd->bound_sets, cmd->bound_offsets, cmd->bound_set_count);
+}
+
+static void record_dispatch(struct mx_cmd *cmd, const uint32_t groups[3], struct mx_buf *indirect,
+                            VkDeviceSize indirect_offset)
+{
+    if (cmd->record_result != VK_SUCCESS)
+        return;
+    if (!cmd->open || !cmd->compute_pipe || !cmd->compute_pipe->compute ||
+        (indirect && (!indirect->mem || indirect_offset % 4 || indirect_offset > indirect->size ||
+                      indirect->size - indirect_offset < 3 * sizeof(uint32_t)))) {
+        cmd->record_result = VK_ERROR_DEVICE_LOST;
+        return;
+    }
+    if (!indirect && (!groups[0] || !groups[1] || !groups[2]))
+        return;
+    struct mx_pipe *graphics = cmd->pipe;
+    cmd->pipe = cmd->compute_pipe;
+    struct mx_draw *dispatch = record_snapshot(cmd, cmd->compute_sets, cmd->compute_offsets, cmd->compute_set_count);
+    cmd->pipe = graphics;
+    if (!dispatch)
+        return;
+    dispatch->operation = 5;
+    dispatch->state.draw = 0;
+    dispatch->state.set = cmd->compute_set_count ? cmd->compute_sets[0] : NULL;
+    if (!indirect)
+        memcpy(dispatch->dispatch, groups, sizeof dispatch->dispatch);
+    dispatch->indirect = indirect;
+    dispatch->indirect_offset = indirect_offset;
+}
+
+static void cmd_dispatch(VkCommandBuffer command, uint32_t x, uint32_t y, uint32_t z)
+{
+    const uint32_t groups[3] = {x, y, z};
+    record_dispatch((struct mx_cmd *)command, groups, NULL, 0);
+}
+
+static void cmd_dispatch_base(VkCommandBuffer command, uint32_t base_x, uint32_t base_y, uint32_t base_z,
+                              uint32_t x, uint32_t y, uint32_t z)
+{
+    struct mx_cmd *cmd = (struct mx_cmd *)command;
+    const uint32_t groups[3] = {x, y, z};
+    if (base_x || base_y || base_z) {
+        if (cmd->record_result == VK_SUCCESS)
+            cmd->record_result = VK_ERROR_DEVICE_LOST;
+        return;
+    }
+    record_dispatch(cmd, groups, NULL, 0);
+}
+
+static void cmd_dispatch_indirect(VkCommandBuffer command, VkBuffer buffer, VkDeviceSize offset)
+{
+    struct mx_cmd *cmd = (struct mx_cmd *)command;
+    const uint32_t groups[3] = {0};
+    if (!buffer) {
+        if (cmd->record_result == VK_SUCCESS)
+            cmd->record_result = VK_ERROR_DEVICE_LOST;
+        return;
+    }
+    record_dispatch(cmd, groups, (struct mx_buf *)buffer, offset);
 }
 
 static void cmd_copy_buffer(VkCommandBuffer command, VkBuffer source, VkBuffer destination,
@@ -2574,7 +2782,9 @@ static VkResult collect_uniforms(struct mx_cmd *cmd, unsigned stage, uint8_t **d
     for (unsigned i = 0; i < shader->uniform_buffer_count; i++) {
         const struct mxgpu_uniform_buffer *ref = &shader->uniform_buffers[i];
         if (ref->push_constant) {
-            VkShaderStageFlags stage_bit = stage == 0 ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT;
+            VkShaderStageFlags stage_bit = stage == 0 ? VK_SHADER_STAGE_VERTEX_BIT :
+                                           stage == MXGPU_VK_COMPUTE_STAGE ? VK_SHADER_STAGE_COMPUTE_BIT :
+                                           VK_SHADER_STAGE_FRAGMENT_BIT;
             if (!cmd->pipe->layout || ref->size > MXGPU_VK_PUSH_CONSTANT_BYTES ||
                 ref->offset > *size || ref->size > *size - ref->offset)
                 goto invalid;
@@ -2634,6 +2844,106 @@ invalid:
     *data = NULL;
     *size = 0;
     return VK_ERROR_DEVICE_LOST;
+}
+
+static VkResult storage_descriptor_range(struct mx_cmd *cmd, const struct mxgpu_storage_binding *ref,
+                                         struct mx_mem **memory, VkDeviceSize *start, VkDeviceSize *bytes)
+{
+    struct mx_set *set = ref->set < cmd->bound_set_count ? cmd->bound_sets[ref->set] : NULL;
+    struct mx_descriptor *descriptor = NULL;
+    unsigned slot = 0;
+    for (unsigned j = 0; set && j < set->descriptor_count; j++)
+        if (set->descriptors[j].binding == ref->binding && set->descriptors[j].element == ref->element)
+            descriptor = &set->descriptors[j], slot = j;
+    struct mx_buf *buffer = descriptor ? (struct mx_buf *)descriptor->value.buffer.buffer : NULL;
+    if (!descriptor || !buffer || !buffer->mem || !buffer->mem->ptr ||
+        (descriptor->type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER &&
+         descriptor->type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC))
+        return VK_ERROR_DEVICE_LOST;
+    VkDeviceSize offset = descriptor->value.buffer.offset, range = descriptor->value.buffer.range;
+    if (offset > buffer->size)
+        return VK_ERROR_DEVICE_LOST;
+    if (descriptor->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
+        if (!cmd->bound_offsets || slot >= cmd->bound_offsets[ref->set].count ||
+            cmd->bound_offsets[ref->set].values[slot] > buffer->size - offset)
+            return VK_ERROR_DEVICE_LOST;
+        offset += cmd->bound_offsets[ref->set].values[slot];
+    }
+    if (range == VK_WHOLE_SIZE)
+        range = buffer->size - offset;
+    if (range > buffer->size - offset || range < 4 || buffer->offset > buffer->mem->size ||
+        offset > buffer->mem->size - buffer->offset || range > buffer->mem->size - buffer->offset - offset ||
+        (buffer->offset + offset) % 4 || buffer->mem->size > UINT32_MAX)
+        return VK_ERROR_DEVICE_LOST;
+    *memory = buffer->mem;
+    *start = buffer->offset + offset;
+    *bytes = range & ~(VkDeviceSize)3;
+    return VK_SUCCESS;
+}
+
+static VkResult perform_dispatch(struct mx_draw *operation)
+{
+    struct mx_cmd *cmd = &operation->state;
+    struct mx_pipe *pipe = cmd->pipe;
+    struct mxgpu_compute_binding bindings[MXGPU_SHADER_STORAGE_BUFFERS + 1];
+    struct mx_mem *memories[MXGPU_SHADER_STORAGE_BUFFERS];
+    uint32_t groups[3], count = 0;
+    uint8_t *uniforms = NULL;
+    uint32_t uniform_bytes = 0;
+    VkResult result;
+    if (!pipe || !pipe->compute || pipe->storage_count > MXGPU_SHADER_STORAGE_BUFFERS)
+        return VK_ERROR_DEVICE_LOST;
+    memcpy(groups, operation->dispatch, sizeof groups);
+    if (operation->indirect) {
+        struct mx_buf *buffer = operation->indirect;
+        if (!buffer->mem || !buffer->mem->ptr || buffer->offset > buffer->mem->size ||
+            operation->indirect_offset > buffer->mem->size - buffer->offset ||
+            buffer->mem->size - buffer->offset - operation->indirect_offset < sizeof groups)
+            return VK_ERROR_DEVICE_LOST;
+        memcpy(groups, (const uint8_t *)buffer->mem->ptr + buffer->offset + operation->indirect_offset, sizeof groups);
+    }
+    if (!groups[0] || !groups[1] || !groups[2])
+        return VK_SUCCESS;
+    for (uint32_t i = 0; i < pipe->storage_count; i++) {
+        const struct mxgpu_storage_binding *ref = &pipe->storage[i];
+        VkDeviceSize start, bytes;
+        result = storage_descriptor_range(cmd, ref, &memories[i], &start, &bytes);
+        if (result != VK_SUCCESS)
+            return result;
+        struct mx_mem *mem = memories[i];
+        if (!mem->storage && !(mem->storage = mxgpu_storage_buffer_create((uint32_t)mem->size)))
+            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        if (mxgpu_storage_buffer_upload(mem->storage, (uint32_t)start, (const uint8_t *)mem->ptr + start, (uint32_t)bytes))
+            return VK_ERROR_DEVICE_LOST;
+        bindings[count++] = (struct mxgpu_compute_binding){
+            (uint16_t)ref->slot,
+            (uint16_t)(ref->access == MXSB_ACCESS_READ ? MXGPU_BIND_ACCESS_READ :
+                       ref->access == MXSB_ACCESS_WRITE ? MXGPU_BIND_ACCESS_WRITE : MXGPU_BIND_ACCESS_READ_WRITE),
+            mem->storage, start, bytes};
+    }
+    result = collect_uniforms(cmd, MXGPU_VK_COMPUTE_STAGE, &uniforms, &uniform_bytes);
+    if (result != VK_SUCCESS)
+        return result;
+    if (uniform_bytes) {
+        int uploaded = pipe->uniform_storage &&
+                       !mxgpu_storage_buffer_upload(pipe->uniform_storage, 0, uniforms, uniform_bytes);
+        free(uniforms);
+        if (!uploaded)
+            return VK_ERROR_DEVICE_LOST;
+        bindings[count++] = (struct mxgpu_compute_binding){
+            (uint16_t)pipe->uniform_slot, MXGPU_BIND_ACCESS_READ, pipe->uniform_storage, 0, uniform_bytes};
+    }
+    if (mxgpu_compute_dispatch(pipe->compute_pipeline, MXGPU_DISPATCH_THREADGROUPS, groups, bindings, count))
+        return VK_ERROR_DEVICE_LOST;
+    for (uint32_t i = 0; i < pipe->storage_count; i++) {
+        if (!(pipe->storage[i].access & MXSB_ACCESS_WRITE))
+            continue;
+        uint8_t *target = (uint8_t *)memories[i]->ptr + bindings[i].offset;
+        if (mxgpu_storage_buffer_read(memories[i]->storage, (uint32_t)bindings[i].offset, target,
+                                      (uint32_t)bindings[i].size))
+            return VK_ERROR_DEVICE_LOST;
+    }
+    return VK_SUCCESS;
 }
 
 static VkResult stage_view_texture(const struct mx_view *view, const uint8_t *source,
@@ -3404,7 +3714,8 @@ static VkResult queue_submit(VkQueue queue, uint32_t count, const VkSubmitInfo *
             struct mx_cmd *cmd = (struct mx_cmd *)submits[i].pCommandBuffers[c];
             struct mx_draw *draw;
             for (draw = cmd->draws; draw; draw = draw->next) {
-                VkResult result = draw->operation == 4 ? perform_pipeline_barrier() :
+                VkResult result = draw->operation == 5 ? perform_dispatch(draw) :
+                                  draw->operation == 4 ? perform_pipeline_barrier() :
                                   draw->operation == 1 ? perform_buffer_copy(draw) :
                                   draw->operation >= 2 ? perform_buffer_image_copy(draw) : perform_draw(&draw->state);
                 if (result != VK_SUCCESS) {
@@ -3706,7 +4017,7 @@ static void mem_props(VkPhysicalDevice gpu, VkPhysicalDeviceMemoryProperties *pr
     props->memoryTypeCount = 1;
     props->memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     props->memoryHeapCount = 1;
-    props->memoryHeaps[0].size = 64ull << 20;
+    props->memoryHeaps[0].size = MXGPU_VK_HEAP_BYTES;
     props->memoryHeaps[0].flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
 }
 
@@ -3752,6 +4063,10 @@ static PFN_vkVoidFunction device_proc(const char *name)
     if (strcmp(name, "vkGetPipelineCacheData") == 0) return (PFN_vkVoidFunction)get_pipeline_cache_data;
     if (strcmp(name, "vkMergePipelineCaches") == 0) return (PFN_vkVoidFunction)merge_pipeline_caches;
     if (strcmp(name, "vkCreateGraphicsPipelines") == 0) return (PFN_vkVoidFunction)create_pipelines;
+    if (strcmp(name, "vkCreateComputePipelines") == 0) return (PFN_vkVoidFunction)create_compute_pipelines;
+    if (strcmp(name, "vkCmdDispatch") == 0) return (PFN_vkVoidFunction)cmd_dispatch;
+    if (strcmp(name, "vkCmdDispatchBase") == 0) return (PFN_vkVoidFunction)cmd_dispatch_base;
+    if (strcmp(name, "vkCmdDispatchIndirect") == 0) return (PFN_vkVoidFunction)cmd_dispatch_indirect;
     if (strcmp(name, "vkDestroyPipeline") == 0) return (PFN_vkVoidFunction)destroy_pipeline;
     if (strcmp(name, "vkCreateFramebuffer") == 0) return (PFN_vkVoidFunction)create_fb;
     if (strcmp(name, "vkDestroyFramebuffer") == 0) return (PFN_vkVoidFunction)destroy_fb;

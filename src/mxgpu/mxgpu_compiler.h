@@ -21,6 +21,11 @@ struct mxgpu_texture_binding {
 };
 #define MXGPU_SHADER_TEXTURES 8u
 #define MXGPU_SHADER_VERTEX_SLOTS 33u
+#define MXGPU_SHADER_STORAGE_BUFFERS 15u
+#define MXGPU_COMPUTE_UNIFORM_BINDING 1u
+struct mxgpu_storage_binding {
+    unsigned set, binding, element, binding_id, slot, access;
+};
 struct mxgpu_shader {
     bool samples;
     bool uses_uniforms;
@@ -39,6 +44,12 @@ struct mxgpu_shader {
     unsigned texture_element;
     unsigned texture_count;
     struct mxgpu_texture_binding textures[MXGPU_SHADER_TEXTURES];
+    bool compute;
+    uint32_t workgroup_size[3];
+    uint32_t workgroup_bytes;
+    unsigned uniform_slot;
+    unsigned storage_count;
+    struct mxgpu_storage_binding storage[MXGPU_SHADER_STORAGE_BUFFERS];
 };
 
 struct nir_shader;
@@ -47,5 +58,6 @@ int mxgpu_link_shaders_draw(const struct mxgpu_shader *vs, const struct mxgpu_sh
                        unsigned vertex_count, bool bound_sampler, uint8_t *out, uint32_t cap, uint32_t *out_len);
 int mxgpu_link_shaders(const struct mxgpu_shader *vs, const struct mxgpu_shader *fs,
                        uint8_t *out, uint32_t cap, uint32_t *out_len);
+int mxgpu_link_compute(const struct mxgpu_shader *cs, uint8_t *out, uint32_t cap, uint32_t *out_len);
 int mxgpu_link_shaders_draw_samplers(const struct mxgpu_shader *vs, const struct mxgpu_shader *fs, unsigned vertex_count, bool bound_sampler, uint8_t *out, uint32_t cap, uint32_t *out_len, const uint32_t *sampler_compare);
 #endif

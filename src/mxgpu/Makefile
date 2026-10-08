@@ -4,7 +4,7 @@
 MXGPU_BUILD ?= ../../build
 MESON ?= meson
 MESON_OPTIONS ?= -Dgallium-drivers=mxgpu -Dvulkan-drivers=mxgpu -Dllvm=disabled -Dplatforms=x11,wayland -Dglx=dri -Degl=enabled -Dgbm=enabled -Dglvnd=enabled -Dvideo-codecs= -Dgallium-va=disabled
-PROGRAMS := gl_scene gl_stress vk_scene vk_stress vk_system vk_client egl_client egl_instancing cs_smoke
+PROGRAMS := gl_scene gl_stress vk_scene vk_stress vk_system vk_client egl_client egl_instancing cs_smoke vk_compute
 REQUESTED_PROGRAMS := $(filter $(PROGRAMS),$(MAKECMDGOALS))
 BUILD_PROGRAMS := $(if $(REQUESTED_PROGRAMS),$(REQUESTED_PROGRAMS),$(PROGRAMS))
 MXGPU_BUILD_JOBS ?= 2
