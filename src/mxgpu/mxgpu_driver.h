@@ -89,12 +89,21 @@ struct mxgpu_native_render_state {
     struct mxgpu_depth_stencil_state depth_stencil;
     struct mxgpu_depth_input depth;
     uint32_t stencil_reference;
+    int bounds_valid;
+    struct mxgpu_scissor bounds;
 };
 struct mxgpu_framebuffer;
 struct mxgpu_framebuffer *mxgpu_framebuffer_create(uint32_t width, uint32_t height);
 int mxgpu_framebuffer_destroy(struct mxgpu_framebuffer *framebuffer);
 int mxgpu_framebuffer_discard(struct mxgpu_framebuffer *framebuffer);
-int mxgpu_framebuffer_sync(struct mxgpu_framebuffer *framebuffer, unsigned char *pixels, int *changed);
+int mxgpu_framebuffer_clear(struct mxgpu_framebuffer *framebuffer, const unsigned char rgba[4], uint64_t cpu_revision);
+typedef void (*mxgpu_row_convert)(unsigned char *destination, const unsigned char *source, unsigned width, unsigned arg);
+int mxgpu_framebuffer_sync(struct mxgpu_framebuffer *framebuffer, unsigned char *destination,
+                           uint32_t destination_stride, mxgpu_row_convert convert, unsigned convert_arg,
+                           int all_rows, int *changed);
+int mxgpu_framebuffer_refresh(struct mxgpu_framebuffer *framebuffer, const unsigned char *source,
+                              uint32_t source_stride, mxgpu_row_convert convert, unsigned convert_arg,
+                              uint64_t cpu_revision);
 int mxgpu_native_render_caps(int fd);
 int mxgpu_native_mip_caps(int fd);
 int mxgpu_native_cube_caps(int fd);

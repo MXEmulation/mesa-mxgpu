@@ -112,7 +112,9 @@ struct mxgpu_framebuffer {
     unsigned char *pixels;
     uint32_t width, height, size;
     uint64_t cpu_revision;
-    int valid, pending, error, unpublished;
+    int valid, pending, error, unpublished, clear_pending;
+    unsigned char clear_bytes[4];
+    uint32_t pending_top, pending_bottom, unpublished_top, unpublished_bottom;
     unsigned resource_id;
     int resource_blocked;
     uint64_t used;
@@ -1840,8 +1842,9 @@ static int readback_rows(struct resource *color, unsigned y0, unsigned rows)
     if (rows > readback_limit() / row)
         return -1;
     bytes = rows * row;
+    int direct = g_dev.native_active && bytes >= sizeof command + 512u;
     capacity = bytes > sizeof command + 512u ? bytes : sizeof command + 512u;
-    buf = scratch_reserve(&g_dev.readback_scratch, capacity);
+    buf = direct ? color->bytes + (size_t)y0 * row : scratch_reserve(&g_dev.readback_scratch, capacity);
     if (!buf)
         return -1;
     memset(request, 0, sizeof request);
@@ -1876,23 +1879,40 @@ static int readback_rows(struct resource *color, unsigned y0, unsigned rows)
     if (posted < 0 || user.size != bytes) {
         return -1;
     }
-    for (i = 0; i < rows; i++)
-        memcpy(color->bytes + (size_t)(g_dev.native_active ? y0 + i : color->height - 1u - (y0 + i)) * row,
-               buf + (size_t)i * row, row);
+    if (!direct)
+        for (i = 0; i < rows; i++)
+            memcpy(color->bytes + (size_t)(g_dev.native_active ? y0 + i : color->height - 1u - (y0 + i)) * row,
+                   buf + (size_t)i * row, row);
+    return 0;
+}
+
+static int readback_range(struct resource *resource, unsigned first, unsigned end)
+{
+    unsigned row, rows_per;
+
+    if (!resource || !resource->bytes || !resource->size || !resource->width || !resource->height || g_dev.fd < 0)
+        return -1;
+    row = resource->width * resource_pixel_bytes(resource);
+    if (!row || row > readback_limit())
+        return -1;
+    rows_per = readback_limit() / row;
+    for (unsigned y = first; y < end; y += rows_per) {
+        unsigned rows = end - y;
+        if (rows > rows_per)
+            rows = rows_per;
+        if (readback_rows(resource, y, rows) != 0)
+            return -1;
+    }
     return 0;
 }
 
 static int readback_attachment(struct resource *resource)
 {
-    unsigned row, rows_per, first = 0, end;
+    unsigned first = 0, end;
 
     if (!resource || !resource->bytes || !resource->size || !resource->width || !resource->height || g_dev.fd < 0)
         return -1;
     end = resource->height;
-    row = resource->width * resource_pixel_bytes(resource);
-    if (!row || row > readback_limit())
-        return -1;
-    rows_per = readback_limit() / row;
     if (g_dev.native_active && g_dev.native_state.rasterizer.scissor_enable) {
         const struct mxgpu_scissor *scissor = &g_dev.native_state.scissor;
         first = scissor->top < end ? scissor->top : end;
@@ -1900,15 +1920,10 @@ static int readback_attachment(struct resource *resource)
         if (scissor->left >= resource->width || scissor->right <= scissor->left || end < first)
             end = first;
     }
-    for (unsigned y = first; y < end; y += rows_per) {
-        unsigned rows = end - y;
-        if (rows > rows_per)
-            rows = rows_per;
-        if (readback_rows(resource, y, rows) != 0) {
-            if (g_dev.native_active)
-                resource->host_current = 0;
-            return -1;
-        }
+    if (readback_range(resource, first, end) != 0) {
+        if (g_dev.native_active)
+            resource->host_current = 0;
+        return -1;
     }
     if (g_dev.native_active)
         resource->host_current = 1;
@@ -1920,28 +1935,65 @@ static int readback_color(void)
     return readback_attachment(res_slot(g_dev.color_id));
 }
 
+static void fill_pixels(unsigned char *pixels, size_t bytes, const unsigned char value[4])
+{
+    uint32_t word;
+    memcpy(&word, value, sizeof word);
+    for (size_t offset = 0; offset + sizeof word <= bytes; offset += sizeof word)
+        memcpy(pixels + offset, &word, sizeof word);
+}
+
+static void framebuffer_rows_add(uint32_t *top, uint32_t *bottom, uint32_t first, uint32_t end)
+{
+    if (first >= end) return;
+    if (*top >= *bottom) {
+        *top = first;
+        *bottom = end;
+        return;
+    }
+    if (first < *top) *top = first;
+    if (end > *bottom) *bottom = end;
+}
+
 static int framebuffer_sync_unlocked(struct mxgpu_framebuffer *framebuffer)
 {
     if (batch_drain_unlocked() || !framebuffer || framebuffer->error) return -1;
+    if (framebuffer->clear_pending) {
+        struct resource *cleared = framebuffer->resource_id ? res_slot(framebuffer->resource_id) : NULL;
+        fill_pixels(framebuffer->pixels, framebuffer->size, framebuffer->clear_bytes);
+        framebuffer->clear_pending = 0;
+        framebuffer->pending = 0;
+        framebuffer->pending_top = framebuffer->pending_bottom = 0;
+        framebuffer->unpublished = 1;
+        framebuffer_rows_add(&framebuffer->unpublished_top, &framebuffer->unpublished_bottom, 0, framebuffer->height);
+        if (cleared) cleared->host_current = 0;
+        return 0;
+    }
     if (!framebuffer->pending) return 0;
     if (!framebuffer->resource_id || g_dev.lost || g_dev.fd < 0) return -1;
     struct resource *color = res_slot(framebuffer->resource_id);
     if (!color || color->width != framebuffer->width || color->height != framebuffer->height ||
         color->size != framebuffer->size) return -1;
+    uint32_t first = framebuffer->pending_top, end = framebuffer->pending_bottom;
+    if (first >= end || end > framebuffer->height) {
+        first = 0;
+        end = framebuffer->height;
+    }
     int native = g_dev.native_active;
-    uint8_t scissor = g_dev.native_state.rasterizer.scissor_enable;
     g_dev.native_active = 1;
-    g_dev.native_state.rasterizer.scissor_enable = 0;
-    int result = readback_attachment(color);
-    g_dev.native_state.rasterizer.scissor_enable = scissor;
+    int result = readback_range(color, first, end);
     g_dev.native_active = native;
     if (result) {
         framebuffer->error = 1;
         color->host_current = 0;
         return result;
     }
-    memcpy(framebuffer->pixels, color->bytes, framebuffer->size);
+    color->host_current = 1;
+    size_t row = (size_t)framebuffer->width * 4u;
+    memcpy(framebuffer->pixels + first * row, color->bytes + first * row, (end - first) * row);
+    framebuffer_rows_add(&framebuffer->unpublished_top, &framebuffer->unpublished_bottom, first, end);
     framebuffer->pending = 0;
+    framebuffer->pending_top = framebuffer->pending_bottom = 0;
     return 0;
 }
 
@@ -2053,15 +2105,24 @@ struct mxgpu_framebuffer *mxgpu_framebuffer_create(uint32_t width, uint32_t heig
     return framebuffer;
 }
 
-int mxgpu_framebuffer_sync(struct mxgpu_framebuffer *framebuffer, unsigned char *pixels, int *changed)
+int mxgpu_framebuffer_sync(struct mxgpu_framebuffer *framebuffer, unsigned char *destination,
+                           uint32_t destination_stride, mxgpu_row_convert convert, unsigned convert_arg,
+                           int all_rows, int *changed)
 {
     if (changed) *changed = 0;
     pthread_mutex_lock(&g_device_mutex);
-    int result = !framebuffer || !pixels || !framebuffer->valid ? -1 : framebuffer_sync_unlocked(framebuffer);
-    if (!result && framebuffer->valid) {
-        memcpy(pixels, framebuffer->pixels, framebuffer->size);
+    int result = !framebuffer || !destination || !convert || !framebuffer->valid ||
+        destination_stride < framebuffer->width * 4u ? -1 : framebuffer_sync_unlocked(framebuffer);
+    if (!result) {
+        uint32_t first = all_rows ? 0 : framebuffer->unpublished_top;
+        uint32_t end = all_rows ? framebuffer->height : framebuffer->unpublished_bottom;
+        if (end > framebuffer->height) end = framebuffer->height;
+        for (uint32_t y = first; y < end; y++)
+            convert(destination + (size_t)y * destination_stride,
+                    framebuffer->pixels + (size_t)y * framebuffer->width * 4u, framebuffer->width, convert_arg);
         if (changed) *changed = framebuffer->unpublished;
         framebuffer->unpublished = 0;
+        framebuffer->unpublished_top = framebuffer->unpublished_bottom = 0;
     }
     pthread_mutex_unlock(&g_device_mutex);
     return result;
@@ -2080,6 +2141,74 @@ int mxgpu_framebuffer_discard(struct mxgpu_framebuffer *framebuffer)
         framebuffer->valid = 0;
         framebuffer->pending = 0;
         framebuffer->unpublished = 0;
+        framebuffer->clear_pending = 0;
+        framebuffer->pending_top = framebuffer->pending_bottom = 0;
+        framebuffer->unpublished_top = framebuffer->unpublished_bottom = 0;
+        if (resource) resource->host_current = 0;
+    }
+    pthread_mutex_unlock(&g_device_mutex);
+    return result;
+}
+
+int mxgpu_framebuffer_refresh(struct mxgpu_framebuffer *framebuffer, const unsigned char *source,
+                              uint32_t source_stride, mxgpu_row_convert convert, unsigned convert_arg,
+                              uint64_t cpu_revision)
+{
+    pthread_mutex_lock(&g_device_mutex);
+    struct resource *resource = framebuffer && framebuffer->resource_id ?
+        res_slot(framebuffer->resource_id) : NULL;
+    size_t row = framebuffer ? (size_t)framebuffer->width * 4u : 0;
+    unsigned char *converted = row ? scratch_reserve(&g_dev.readback_scratch, (uint32_t)row) : NULL;
+    int result = !framebuffer || !source || !convert || !converted || g_dev.lost || !framebuffer->valid ||
+        framebuffer->error || framebuffer->pending || framebuffer->clear_pending || framebuffer->resource_blocked ||
+        source_stride < row || (framebuffer->resource_id && (!resource || resource->width != framebuffer->width ||
+        resource->height != framebuffer->height || resource->size != framebuffer->size || !resource->bytes)) ? -1 : 0;
+    if (!result && resource && resource->batch_pinned && batch_drain_unlocked()) result = -1;
+    if (!result) {
+        uint32_t first = framebuffer->height, end = 0;
+        for (uint32_t y = 0; y < framebuffer->height; y++) {
+            unsigned char *pixels = framebuffer->pixels + y * row;
+            convert(converted, source + (size_t)y * source_stride, framebuffer->width, convert_arg);
+            if (!memcmp(converted, pixels, row)) continue;
+            memcpy(pixels, converted, row);
+            if (first > y) first = y;
+            end = y + 1u;
+        }
+        framebuffer->cpu_revision = cpu_revision;
+        if (first < end && resource && resource->host_live && resource->host_current) {
+            memcpy(resource->bytes + first * row, framebuffer->pixels + first * row, (end - first) * row);
+            resource->host_current = 0;
+            resource->dirty_begin = (unsigned)(first * row);
+            resource->dirty_end = (unsigned)(end * row);
+            if (transfer_bytes(framebuffer->resource_id)) {
+                framebuffer->valid = 0;
+                result = -1;
+            }
+        } else if (first < end && resource) {
+            resource->host_current = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_device_mutex);
+    return result;
+}
+
+int mxgpu_framebuffer_clear(struct mxgpu_framebuffer *framebuffer, const unsigned char rgba[4], uint64_t cpu_revision)
+{
+    pthread_mutex_lock(&g_device_mutex);
+    struct resource *resource = framebuffer && framebuffer->resource_id ?
+        res_slot(framebuffer->resource_id) : NULL;
+    int result = !framebuffer || !rgba || g_dev.lost || framebuffer->error ||
+        framebuffer->resource_blocked || (framebuffer->resource_id &&
+        (!resource || resource->width != framebuffer->width ||
+         resource->height != framebuffer->height || resource->size != framebuffer->size)) ? -1 : 0;
+    if (!result) {
+        framebuffer->valid = 1;
+        framebuffer->cpu_revision = cpu_revision;
+        framebuffer->pending = 0;
+        framebuffer->pending_top = framebuffer->pending_bottom = 0;
+        framebuffer->unpublished = 1;
+        framebuffer->clear_pending = 1;
+        memcpy(framebuffer->clear_bytes, rgba, sizeof framebuffer->clear_bytes);
         if (resource) resource->host_current = 0;
     }
     pthread_mutex_unlock(&g_device_mutex);
@@ -2532,6 +2661,9 @@ static int draw_scene(void)
     uint8_t payload[1024];
     uint32_t n = 0;
     unsigned stage;
+    struct mxgpu_framebuffer *clear_target = g_dev.native_active && g_dev.framebuffer &&
+        g_dev.framebuffer->clear_pending && g_dev.framebuffer->resource_id == g_dev.color_id ?
+        g_dev.framebuffer : NULL;
     if (ensure_pipeline() != 0)
         return -1;
     if (create_buffer_resource(g_dev.vertex_id) != 0)
@@ -2623,6 +2755,11 @@ static int draw_scene(void)
         extended.color_targets[0].format = MXGPU_FMT_RGBA8_UNORM;
         extended.color_targets[0].load_action = submit.load_action;
         extended.color_targets[0].store_action = submit.store_action;
+        if (clear_target) {
+            extended.color_targets[0].load_action = MXGPU_LOAD_CLEAR;
+            for (unsigned c = 0; c < 4; c++)
+                extended.color_targets[0].clear_rgba[c] = f_u32(clear_target->clear_bytes[c] / 255.0f);
+        }
         extended.viewport_count = 1;
         extended.viewports[0] = g_dev.native_state.viewport;
         extended.scissor_count = g_dev.native_state.rasterizer.scissor_enable ? 1 : 0;
@@ -2650,6 +2787,10 @@ static int draw_scene(void)
         return -1;
     }
     g_needs_clear = 0;
+    if (clear_target) {
+        clear_target->clear_pending = 0;
+        framebuffer_rows_add(&clear_target->pending_top, &clear_target->pending_bottom, 0, clear_target->height);
+    }
     g_readback_done = 0;
     if (!g_dev.deferred_readback && g_dev.fd >= 0 && (unsigned long)g_rt_w * g_rt_h * 4u <= readback_limit()) {
         if (readback_color() != 0)
@@ -3037,7 +3178,8 @@ static int mxgpu_execute_module_uniforms_unlocked(const uint8_t *module, uint32_
             if (input->framebuffer) {
                 struct mxgpu_framebuffer *source = input->framebuffer;
                 struct resource *resident = res_slot(source->resource_id);
-                if (resident && !source->resource_blocked && resident->host_live && (resident->host_usage & MXGPU_USAGE_SAMPLED)) {
+                if (resident && !source->resource_blocked && !source->clear_pending && resident->host_live &&
+                    (resident->host_usage & MXGPU_USAGE_SAMPLED)) {
                     g_dev.texture_ids[texture] = source->resource_id;
                     source->used = ++g_dev.framebuffer_clock;
                     continue;
@@ -3583,6 +3725,9 @@ static int execute_module_transaction_resources(int fd, const uint8_t *module, u
                 framebuffer->cpu_revision = cpu_revision;
                 framebuffer->valid = 1;
                 framebuffer->pending = framebuffer->error = framebuffer->unpublished = 0;
+                framebuffer->clear_pending = 0;
+                framebuffer->pending_top = framebuffer->pending_bottom = 0;
+                framebuffer->unpublished_top = framebuffer->unpublished_bottom = 0;
             }
         }
         if (!result) {
@@ -3592,7 +3737,9 @@ static int execute_module_transaction_resources(int fd, const uint8_t *module, u
     }
     if (!result) {
         operation = "color-seed";
-        if (!framebuffer || framebuffer_needs_seed)
+        if (framebuffer && framebuffer->clear_pending)
+            result = ensure_color_resource((unsigned)cw, (unsigned)ch);
+        else if (!framebuffer || framebuffer_needs_seed)
             result = mxgpu_seed_color_unlocked(framebuffer ? framebuffer->pixels : initial_color, cw, ch);
         if (!result && framebuffer) g_dev.framebuffer = framebuffer;
     }
@@ -3648,8 +3795,20 @@ static int execute_module_transaction_resources(int fd, const uint8_t *module, u
                 operation, result, errno, state != NULL, (unsigned long long)g_dev.caps.features);
 
     if (!result && framebuffer) {
+        uint32_t first = 0, end = framebuffer->height;
+        if (state->rasterizer.scissor_enable) {
+            first = state->scissor.top < end ? state->scissor.top : end;
+            end = state->scissor.bottom < end ? state->scissor.bottom : end;
+        }
+        if (state->bounds_valid) {
+            if (state->bounds.top > first) first = state->bounds.top < end ? state->bounds.top : end;
+            if (state->bounds.bottom < end) end = state->bounds.bottom > first ? state->bounds.bottom : first;
+        }
+        framebuffer_rows_add(&framebuffer->pending_top, &framebuffer->pending_bottom, first, end);
         framebuffer->pending = framebuffer->unpublished = 1;
     }
+    if (result && framebuffer && framebuffer->pending)
+        framebuffer_rows_add(&framebuffer->pending_top, &framebuffer->pending_bottom, 0, framebuffer->height);
     if (!result && readback_complete)
         *readback_complete = framebuffer == NULL;
     g_dev.batch_collect = 0;
