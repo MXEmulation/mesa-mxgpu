@@ -4,7 +4,7 @@
 #define MXGPU_COMPILER_H
 #include <stdbool.h>
 #include <stdint.h>
-#define MX_LOW_INSNS 2048u
+#define MX_LOW_INSNS 8192u
 #define MXGPU_SHADER_INSTRUCTION_WORDS 14u
 #define MXGPU_LINK_MODULE_CAPACITY (MX_LOW_INSNS * MXGPU_SHADER_INSTRUCTION_WORDS * 8u + 4096u)
 struct mxgpu_uniform_buffer {
@@ -18,8 +18,20 @@ struct mxgpu_texture_binding {
     unsigned set, binding, element, texture_id, texture_slot, sampler_id, sampler_slot;
     unsigned binding_kind;
     bool shadow;
+    bool separate_sampler;
+    unsigned sampler_set, sampler_binding, sampler_element;
 };
 #define MXGPU_SHADER_TEXTURES 8u
+#define MXGPU_SHADER_COLOR_OUTPUTS 8u
+#define MXGPU_LINK_COVERAGE_OUTPUT MXGPU_SHADER_COLOR_OUTPUTS
+#define MXGPU_SHADER_SIZE_QUERIES 32u
+#define MXGPU_FRAG_COORD_LOCATION 31u
+#define MXGPU_VIEWPORT_TERMS 6u
+struct mxgpu_size_query {
+    unsigned record, texture, lane, level;
+    bool as_float;
+    unsigned viewport_term;
+};
 #define MXGPU_SHADER_VERTEX_SLOTS 33u
 #define MXGPU_SHADER_STORAGE_BUFFERS 15u
 #define MXGPU_COMPUTE_UNIFORM_BINDING 1u
@@ -50,14 +62,25 @@ struct mxgpu_shader {
     unsigned uniform_slot;
     unsigned storage_count;
     struct mxgpu_storage_binding storage[MXGPU_SHADER_STORAGE_BUFFERS];
+    uint32_t color_output_mask;
+    unsigned color_output_ids[MXGPU_SHADER_COLOR_OUTPUTS];
+    unsigned id_count;
+    bool frag_coord;
+    unsigned size_query_count;
+    struct mxgpu_size_query size_queries[MXGPU_SHADER_SIZE_QUERIES];
 };
 
 struct nir_shader;
 int mxgpu_compile_nir(struct nir_shader *nir, bool fragment, struct mxgpu_shader *shader);
+void mxgpu_shader_copy(struct mxgpu_shader *destination, const struct mxgpu_shader *source);
 int mxgpu_link_shaders_draw(const struct mxgpu_shader *vs, const struct mxgpu_shader *fs,
                        unsigned vertex_count, bool bound_sampler, uint8_t *out, uint32_t cap, uint32_t *out_len);
 int mxgpu_link_shaders(const struct mxgpu_shader *vs, const struct mxgpu_shader *fs,
                        uint8_t *out, uint32_t cap, uint32_t *out_len);
 int mxgpu_link_compute(const struct mxgpu_shader *cs, uint8_t *out, uint32_t cap, uint32_t *out_len);
 int mxgpu_link_shaders_draw_samplers(const struct mxgpu_shader *vs, const struct mxgpu_shader *fs, unsigned vertex_count, bool bound_sampler, uint8_t *out, uint32_t cap, uint32_t *out_len, const uint32_t *sampler_compare);
+int mxgpu_link_shaders_draw_output(const struct mxgpu_shader *vs, const struct mxgpu_shader *fs, unsigned vertex_count,
+                                   bool bound_sampler, uint8_t *out, uint32_t cap, uint32_t *out_len,
+                                   const uint32_t *sampler_compare, unsigned color_output,
+                                   const uint32_t *texture_extents, const float *viewport_terms);
 #endif

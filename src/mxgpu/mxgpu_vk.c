@@ -3,6 +3,7 @@
 #include "mxgpu_driver.h"
 #include "mxgpu_compiler.h"
 #include "nir.h"
+#include "nir_builder.h"
 #include "compiler/spirv/nir_spirv.h"
 #include "vulkan/util/vk_format.h"
 #include "mx_le.h"
@@ -13,6 +14,7 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include <time.h>
+#include <math.h>
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_icd.h>
 
@@ -31,6 +33,9 @@
 #define MXGPU_VK_MAX_BOUND_SETS 8u
 #define MXGPU_VK_MAX_PER_SET_DESCRIPTORS 1024u
 #define MXGPU_VK_DRIVER_ID ((VkDriverId)0x4d584750)
+#define MXGPU_VK_COLOR_ATTACHMENTS MXGPU_SHADER_COLOR_OUTPUTS
+#define MXGPU_VK_EVENT_TIMEOUT_NS 10000000000ull
+#define MXGPU_VK_LOOP_BOUND 128u
 static const uint8_t mx_pipeline_cache_uuid[VK_UUID_SIZE] = {
     'M', 'X', 'G', 'P', 'U', '-', 'S', 'P', 'I', 'R', 'V', '-', '0', '0', '0', '1'
 };
@@ -94,6 +99,11 @@ struct mx_pipe {
     struct mx_pipeline_layout *layout;
     struct mxgpu_shader *vertex_shader, *fragment_shader;
     struct mxgpu_native_render_state native_state;
+    struct mxgpu_blend_target blend_targets[MXGPU_VK_COLOR_ATTACHMENTS];
+    uint32_t color_count;
+    bool depth_bias;
+    float depth_bias_constant, depth_bias_clamp, depth_bias_slope;
+    bool dynamic_depth_bias, dynamic_line_width;
     VkViewport viewport;
     VkRect2D scissor;
     bool viewport_set, scissor_set;
@@ -132,17 +142,39 @@ struct mx_pipe {
 };
 
 struct mx_fb {
-    struct mx_view *color;
-    struct mx_view *depth;
+    uint32_t attachment_count;
+    struct mx_view **views;
     uint32_t width, height;
 };
 
+struct mx_subpass {
+    uint32_t color_count;
+    uint32_t colors[MXGPU_VK_COLOR_ATTACHMENTS];
+    uint32_t depth;
+};
+
 struct mx_renderpass {
-    uint32_t color_attachment;
-    VkAttachmentLoadOp load;
-    uint32_t depth_attachment;
-    VkFormat color_format, depth_format;
-    VkAttachmentLoadOp depth_load, stencil_load;
+    uint32_t attachment_count, subpass_count;
+    VkAttachmentDescription *attachments;
+    uint32_t *first_subpass;
+    struct mx_subpass *subpasses;
+};
+
+struct mx_buffer_view {
+    struct mx_buf *buffer;
+    VkFormat format;
+    VkDeviceSize offset, range;
+};
+
+struct mx_event {
+    atomic_int signaled;
+};
+
+struct mx_query_pool {
+    VkQueryType type;
+    uint32_t count;
+    uint64_t *values;
+    atomic_int *available;
 };
 
 struct mx_sampler {
@@ -262,11 +294,21 @@ struct mx_cmd {
     uint32_t compute_set_count;
     int draw;
     int open;
-    int clear;
-    VkClearColorValue clear_color;
-    VkRect2D clear_area;
-    VkImageAspectFlags clear_depth_aspects;
-    VkClearDepthStencilValue clear_depth;
+    VkCommandBufferLevel level;
+    struct mx_renderpass *pass;
+    uint32_t subpass;
+    VkRect2D render_area;
+    struct mx_view *colors[MXGPU_VK_COLOR_ATTACHMENTS];
+    uint32_t color_count;
+    struct mx_view *depth_view;
+    VkClearValue *clear_values;
+    uint32_t clear_value_count;
+    float depth_bias[3];
+    bool depth_bias_set;
+    float depth_bounds[2];
+    float line_width;
+    struct mx_query_pool *occlusion_pool;
+    uint32_t occlusion_query;
     struct mx_buf *ibo;
     VkDeviceSize ioff;
     VkIndexType index_type;
@@ -281,6 +323,30 @@ struct mx_cmd {
     unsigned stencil_compare_set, stencil_write_set, stencil_ref_set;
 };
 
+enum mx_operation {
+    MX_OP_DRAW = 0,
+    MX_OP_COPY_BUFFER = 1,
+    MX_OP_BUFFER_TO_IMAGE = 2,
+    MX_OP_IMAGE_TO_BUFFER = 3,
+    MX_OP_BARRIER = 4,
+    MX_OP_DISPATCH = 5,
+    MX_OP_CLEAR_VIEW,
+    MX_OP_DRAW_INDIRECT,
+    MX_OP_FILL_BUFFER,
+    MX_OP_UPDATE_BUFFER,
+    MX_OP_COPY_IMAGE,
+    MX_OP_BLIT_IMAGE,
+    MX_OP_RESOLVE_IMAGE,
+    MX_OP_CLEAR_IMAGE,
+    MX_OP_SET_EVENT,
+    MX_OP_WAIT_EVENTS,
+    MX_OP_RESET_QUERIES,
+    MX_OP_BEGIN_QUERY,
+    MX_OP_END_QUERY,
+    MX_OP_TIMESTAMP,
+    MX_OP_COPY_QUERIES,
+};
+
 struct mx_draw {
     struct mx_cmd state;
     int operation;
@@ -291,6 +357,27 @@ struct mx_draw {
     uint32_t dispatch[3];
     struct mx_buf *indirect;
     VkDeviceSize indirect_offset;
+    uint32_t indirect_count, indirect_stride;
+    struct mx_view *clear_view;
+    uint32_t clear_slot;
+    VkImageAspectFlags clear_aspects;
+    VkClearValue clear_value;
+    VkRect2D clear_rect;
+    struct mx_img *src_image, *dst_image;
+    VkImageCopy image_copy;
+    VkImageBlit image_blit;
+    VkImageResolve image_resolve;
+    VkImageSubresourceRange clear_range;
+    VkFilter filter;
+    uint32_t fill_value;
+    uint8_t *update_data;
+    struct mx_event **events;
+    uint32_t event_count;
+    int event_value;
+    struct mx_query_pool *query_pool;
+    uint32_t first_query, query_count;
+    VkDeviceSize query_stride;
+    VkQueryResultFlags query_flags;
     struct mx_draw *next;
 };
 
@@ -316,6 +403,9 @@ static void free_bound_state(struct mx_cmd *cmd)
     free(cmd->bound_sets);
     free_bound_offsets(cmd->compute_offsets, cmd->compute_set_count);
     free(cmd->compute_sets);
+    free(cmd->clear_values);
+    cmd->clear_values = NULL;
+    cmd->clear_value_count = 0;
     release_push_layouts(cmd);
 }
 
@@ -327,6 +417,8 @@ static void free_draws(struct mx_cmd *cmd)
         free_bound_offsets(draw->state.bound_offsets, draw->state.bound_set_count);
         free(draw->state.bound_sets);
         release_push_layouts(&draw->state);
+        free(draw->update_data);
+        free(draw->events);
         free(draw);
     }
     cmd->last_draw = NULL;
@@ -370,15 +462,20 @@ struct mx_device {
     bool swapchain_enabled;
 };
 
+static const VkExtensionProperties mx_instance_extensions[] = {
+    {VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_SPEC_VERSION},
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
+    {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_SURFACE_SPEC_VERSION},
+    {VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME, VK_KHR_WAYLAND_SURFACE_SPEC_VERSION},
+#endif
+};
+
 static bool instance_extension_supported(const char *name)
 {
-#ifdef VK_USE_PLATFORM_WAYLAND_KHR
-    return name && (!strcmp(name, VK_KHR_SURFACE_EXTENSION_NAME) ||
-                    !strcmp(name, VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME));
-#else
-    (void)name;
+    for (size_t i = 0; name && i < sizeof mx_instance_extensions / sizeof mx_instance_extensions[0]; i++)
+        if (!strcmp(name, mx_instance_extensions[i].extensionName))
+            return true;
     return false;
-#endif
 }
 
 static VkResult create_instance(const VkInstanceCreateInfo *info, const VkAllocationCallbacks *alloc, VkInstance *out)
@@ -483,13 +580,15 @@ static void device_props(VkPhysicalDevice gpu, VkPhysicalDeviceProperties *props
     limits->maxVertexInputBindingStride = UINT32_MAX;
     limits->maxVertexOutputComponents = MXGPU_VK_INTERSTAGE_COMPONENTS;
     limits->maxFragmentInputComponents = MXGPU_VK_INTERSTAGE_COMPONENTS;
-    limits->maxFragmentOutputAttachments = 1;
-    limits->maxFragmentCombinedOutputResources = 1;
+    limits->maxFragmentOutputAttachments = MXGPU_VK_COLOR_ATTACHMENTS;
+    limits->maxFragmentCombinedOutputResources = MXGPU_VK_COLOR_ATTACHMENTS;
     limits->subPixelPrecisionBits = 4;
     limits->subTexelPrecisionBits = 4;
     limits->mipmapPrecisionBits = 4;
     limits->maxDrawIndexedIndexValue = UINT32_MAX;
-    limits->maxDrawIndirectCount = 1;
+    limits->maxDrawIndirectCount = UINT32_MAX;
+    limits->timestampComputeAndGraphics = VK_TRUE;
+    limits->timestampPeriod = 1.0f;
     limits->maxSamplerLodBias = 2.0f;
     limits->maxSamplerAnisotropy = 1.0f;
     limits->maxViewports = 1;
@@ -506,7 +605,7 @@ static void device_props(VkPhysicalDevice gpu, VkPhysicalDeviceProperties *props
     limits->framebufferColorSampleCounts = VK_SAMPLE_COUNT_1_BIT;
     limits->framebufferDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT;
     limits->framebufferStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT;
-    limits->maxColorAttachments = 1;
+    limits->maxColorAttachments = MXGPU_VK_COLOR_ATTACHMENTS;
     limits->sampledImageColorSampleCounts = VK_SAMPLE_COUNT_1_BIT;
     limits->sampledImageIntegerSampleCounts = VK_SAMPLE_COUNT_1_BIT;
     limits->sampledImageDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT;
@@ -549,6 +648,7 @@ static void queue_props(VkPhysicalDevice gpu, uint32_t *count, VkQueueFamilyProp
     memset(props, 0, sizeof *props);
     props[0].queueFlags = VK_QUEUE_GRAPHICS_BIT | (vk_compute_supported() ? VK_QUEUE_COMPUTE_BIT : 0);
     props[0].queueCount = 1;
+    props[0].timestampValidBits = 64;
     props[0].minImageTransferGranularity = (VkExtent3D){1, 1, 1};
     *count = 1;
 }
@@ -1091,62 +1191,172 @@ static void destroy_layout(VkDevice device, VkPipelineLayout layout, const VkAll
     release_layout((struct mx_pipeline_layout *)layout);
 }
 
+static void destroy_renderpass(VkDevice device, VkRenderPass handle, const VkAllocationCallbacks *alloc)
+{
+    struct mx_renderpass *pass = (struct mx_renderpass *)handle;
+    (void)device;
+    (void)alloc;
+    if (!pass)
+        return;
+    free(pass->attachments);
+    free(pass->first_subpass);
+    free(pass->subpasses);
+    free(pass);
+}
+
 static VkResult create_renderpass(VkDevice device, const VkRenderPassCreateInfo *info, const VkAllocationCallbacks *alloc, VkRenderPass *out)
 {
     struct mx_renderpass *pass;
-    (void)device;
-    (void)alloc;
     *out = VK_NULL_HANDLE;
-    if (info->subpassCount != 1 || !info->pSubpasses ||
+    if (!info->subpassCount || !info->pSubpasses ||
         (info->attachmentCount && !info->pAttachments))
         return VK_ERROR_FEATURE_NOT_PRESENT;
-    const VkSubpassDescription *subpass = info->pSubpasses;
-    if (subpass->pipelineBindPoint != VK_PIPELINE_BIND_POINT_GRAPHICS ||
-        subpass->colorAttachmentCount > 1 || subpass->inputAttachmentCount ||
-        subpass->pResolveAttachments ||
-        (subpass->colorAttachmentCount && !subpass->pColorAttachments))
-        return VK_ERROR_FEATURE_NOT_PRESENT;
+    for (uint32_t s = 0; s < info->subpassCount; s++) {
+        const VkSubpassDescription *subpass = &info->pSubpasses[s];
+        if (subpass->pipelineBindPoint != VK_PIPELINE_BIND_POINT_GRAPHICS ||
+            subpass->colorAttachmentCount > MXGPU_VK_COLOR_ATTACHMENTS || subpass->inputAttachmentCount ||
+            (subpass->colorAttachmentCount && !subpass->pColorAttachments))
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        for (uint32_t c = 0; subpass->pResolveAttachments && c < subpass->colorAttachmentCount; c++)
+            if (subpass->pResolveAttachments[c].attachment != VK_ATTACHMENT_UNUSED)
+                return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
     pass = calloc(1, sizeof *pass);
     if (!pass)
         return VK_ERROR_OUT_OF_HOST_MEMORY;
-    pass->color_attachment = VK_ATTACHMENT_UNUSED;
-    pass->depth_attachment = VK_ATTACHMENT_UNUSED;
-    if (subpass->colorAttachmentCount) {
-        uint32_t attachment = subpass->pColorAttachments[0].attachment;
-        if (attachment != VK_ATTACHMENT_UNUSED) {
-            if (attachment >= info->attachmentCount ||
-                vk_color_format(info->pAttachments[attachment].format) == PIPE_FORMAT_NONE ||
-                info->pAttachments[attachment].samples != VK_SAMPLE_COUNT_1_BIT)
-                goto unsupported;
-            pass->color_attachment = attachment;
-            pass->load = info->pAttachments[attachment].loadOp;
-            pass->color_format = info->pAttachments[attachment].format;
-        }
+    pass->attachment_count = info->attachmentCount;
+    pass->subpass_count = info->subpassCount;
+    pass->attachments = info->attachmentCount ? calloc(info->attachmentCount, sizeof *pass->attachments) : NULL;
+    pass->first_subpass = info->attachmentCount ? calloc(info->attachmentCount, sizeof *pass->first_subpass) : NULL;
+    pass->subpasses = calloc(info->subpassCount, sizeof *pass->subpasses);
+    if ((info->attachmentCount && (!pass->attachments || !pass->first_subpass)) || !pass->subpasses) {
+        destroy_renderpass(device, (VkRenderPass)pass, alloc);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
-    if (subpass->pDepthStencilAttachment &&
-        subpass->pDepthStencilAttachment->attachment != VK_ATTACHMENT_UNUSED) {
-        uint32_t attachment = subpass->pDepthStencilAttachment->attachment;
-        if (attachment >= info->attachmentCount ||
-            !vk_depth_format(info->pAttachments[attachment].format) ||
-            info->pAttachments[attachment].samples != VK_SAMPLE_COUNT_1_BIT)
+    for (uint32_t a = 0; a < info->attachmentCount; a++) {
+        pass->attachments[a] = info->pAttachments[a];
+        pass->first_subpass[a] = UINT32_MAX;
+        if (info->pAttachments[a].samples != VK_SAMPLE_COUNT_1_BIT ||
+            (vk_color_format(info->pAttachments[a].format) == PIPE_FORMAT_NONE &&
+             !vk_depth_format(info->pAttachments[a].format)))
             goto unsupported;
-        pass->depth_attachment = attachment;
-        pass->depth_format = info->pAttachments[attachment].format;
-        pass->depth_load = info->pAttachments[attachment].loadOp;
-        pass->stencil_load = info->pAttachments[attachment].stencilLoadOp;
+    }
+    for (uint32_t s = 0; s < info->subpassCount; s++) {
+        const VkSubpassDescription *subpass = &info->pSubpasses[s];
+        struct mx_subpass *target = &pass->subpasses[s];
+        target->color_count = subpass->colorAttachmentCount;
+        target->depth = VK_ATTACHMENT_UNUSED;
+        for (uint32_t c = 0; c < subpass->colorAttachmentCount; c++) {
+            uint32_t attachment = subpass->pColorAttachments[c].attachment;
+            target->colors[c] = attachment;
+            if (attachment == VK_ATTACHMENT_UNUSED)
+                continue;
+            if (attachment >= info->attachmentCount ||
+                vk_color_format(info->pAttachments[attachment].format) == PIPE_FORMAT_NONE)
+                goto unsupported;
+            if (pass->first_subpass[attachment] == UINT32_MAX)
+                pass->first_subpass[attachment] = s;
+        }
+        if (subpass->pDepthStencilAttachment &&
+            subpass->pDepthStencilAttachment->attachment != VK_ATTACHMENT_UNUSED) {
+            uint32_t attachment = subpass->pDepthStencilAttachment->attachment;
+            if (attachment >= info->attachmentCount || !vk_depth_format(info->pAttachments[attachment].format))
+                goto unsupported;
+            target->depth = attachment;
+            if (pass->first_subpass[attachment] == UINT32_MAX)
+                pass->first_subpass[attachment] = s;
+        }
     }
     *out = (VkRenderPass)pass;
     return VK_SUCCESS;
 unsupported:
-    free(pass);
+    destroy_renderpass(device, (VkRenderPass)pass, alloc);
     return VK_ERROR_FORMAT_NOT_SUPPORTED;
 }
 
-static void destroy_renderpass(VkDevice device, VkRenderPass pass, const VkAllocationCallbacks *alloc)
+static bool vk_bound_loop_limits(nir_shader *nir, unsigned bound)
 {
-    (void)device;
-    (void)alloc;
-    free(pass);
+    bool progress = false;
+    nir_foreach_function_impl(impl, nir) {
+        nir_builder b = nir_builder_create(impl);
+        nir_foreach_block(block, impl) {
+            nir_if *nif = nir_block_get_following_if(block);
+            if (!nif || nif->cf_node.parent->type != nir_cf_node_loop)
+                continue;
+            nir_loop *loop = nir_cf_node_as_loop(nif->cf_node.parent);
+            nir_instr *then_last = nir_block_last_instr(nir_if_last_then_block(nif));
+            nir_instr *else_last = nir_block_last_instr(nir_if_last_else_block(nif));
+            bool breaks = (then_last && then_last->type == nir_instr_type_jump &&
+                           nir_instr_as_jump(then_last)->type == nir_jump_break) ||
+                          (else_last && else_last->type == nir_instr_type_jump &&
+                           nir_instr_as_jump(else_last)->type == nir_jump_break);
+            nir_instr *parent = nir_def_instr(nif->condition.ssa);
+            if (!breaks || parent->type != nir_instr_type_alu)
+                continue;
+            nir_alu_instr *alu = nir_instr_as_alu(parent);
+            if (alu->op == nir_op_inot && nir_def_instr(alu->src[0].src.ssa)->type == nir_instr_type_alu)
+                alu = nir_instr_as_alu(nir_def_instr(alu->src[0].src.ssa));
+            nir_op minimum;
+            switch (alu->op) {
+            case nir_op_ult: case nir_op_uge: minimum = nir_op_umin; break;
+            case nir_op_ilt: case nir_op_ige: minimum = nir_op_imin; break;
+            case nir_op_flt: case nir_op_fge: minimum = nir_op_fmin; break;
+            default: continue;
+            }
+            if (alu->def.bit_size != 1 || alu->src[0].src.ssa->bit_size != 32)
+                continue;
+            int induction = -1;
+            for (unsigned i = 0; i < 2; i++) {
+                nir_instr *source = nir_def_instr(alu->src[i].src.ssa);
+                if (source->type == nir_instr_type_phi && source->block == nir_loop_first_block(loop))
+                    induction = (int)i;
+            }
+            unsigned limit = induction == 0 ? 1 : 0;
+            if (induction < 0 || nir_src_is_const(alu->src[limit].src))
+                continue;
+            b.cursor = nir_before_instr(&alu->instr);
+            nir_def *value = nir_mov_alu(&b, alu->src[limit], 1);
+            nir_def *cap = minimum == nir_op_fmin ? nir_imm_float(&b, (float)bound) : nir_imm_int(&b, (int)bound);
+            nir_def *clamped = nir_build_alu2(&b, minimum, value, cap);
+            nir_src_rewrite(&alu->src[limit].src, clamped);
+            alu->src[limit].swizzle[0] = 0;
+            progress = true;
+        }
+        nir_progress(progress, impl, nir_metadata_none);
+    }
+    return progress;
+}
+
+static unsigned vk_loop_count(nir_shader *nir)
+{
+    unsigned loops = 0;
+    nir_foreach_function_impl(impl, nir)
+        nir_foreach_block(block, impl)
+            loops += block->cf_node.parent && block->cf_node.parent->type == nir_cf_node_loop &&
+                     nir_loop_first_block(nir_cf_node_as_loop(block->cf_node.parent)) == block;
+    return loops;
+}
+
+static void vk_optimize(nir_shader *nir)
+{
+    bool progress;
+    unsigned rounds = 0;
+    do {
+        progress = false;
+        progress |= nir_lower_vars_to_ssa(nir);
+        progress |= nir_opt_copy_prop_vars(nir);
+        progress |= nir_opt_dead_write_vars(nir);
+        progress |= nir_opt_copy_prop(nir);
+        progress |= nir_opt_dce(nir);
+        progress |= nir_opt_cse(nir);
+        progress |= nir_opt_constant_folding(nir);
+        progress |= nir_opt_dead_cf(nir);
+        progress |= nir_opt_remove_phis(nir);
+        progress |= nir_opt_if(nir, 0);
+        progress |= nir_opt_algebraic(nir);
+        progress |= nir_opt_undef(nir);
+        progress |= nir_opt_loop_unroll(nir);
+    } while (progress && ++rounds < 32);
 }
 
 static int compile_spirv_stage(const VkPipelineShaderStageCreateInfo *stage, struct mxgpu_shader *compiled)
@@ -1156,7 +1366,7 @@ static int compile_spirv_stage(const VkPipelineShaderStageCreateInfo *stage, str
         .environment = NIR_SPIRV_VULKAN,
         .skip_os_break_in_debug_build = true,
     };
-    static const nir_shader_compiler_options nir_options = {0};
+    static const nir_shader_compiler_options nir_options = {.max_unroll_iterations = MXGPU_VK_LOOP_BOUND};
     struct nir_spirv_specialization spec = {0};
     nir_shader *nir;
     int result;
@@ -1192,14 +1402,40 @@ static int compile_spirv_stage(const VkPipelineShaderStageCreateInfo *stage, str
         glsl_type_singleton_decref();
         return -1;
     }
+    nir_lower_variable_initializers(nir, nir_var_function_temp);
+    nir_lower_returns(nir);
+    nir_inline_functions(nir);
+    nir_remove_non_entrypoints(nir);
+    nir_split_per_member_structs(nir);
+    if (mesa_stage != MESA_SHADER_COMPUTE)
+        nir_lower_io_vars_to_temporaries(nir, nir_shader_get_entrypoint(nir), nir_var_shader_out);
+    nir_lower_global_vars_to_local(nir);
+    if (mesa_stage == MESA_SHADER_VERTEX)
+        nir_foreach_variable_with_modes(var, nir, nir_var_shader_in)
+            if (var->data.location >= VERT_ATTRIB_GENERIC0)
+                var->data.driver_location = var->data.location - VERT_ATTRIB_GENERIC0;
+    nir_opt_copy_prop(nir);
+    nir_opt_deref(nir);
+    nir_lower_variable_initializers(nir, ~nir_var_function_temp);
     nir_split_var_copies(nir);
     nir_lower_var_copies(nir);
+    nir_lower_indirect_derefs_to_if_else_trees(nir, nir_var_function_temp, UINT32_MAX);
     nir_lower_vars_to_ssa(nir);
     nir_opt_copy_prop_vars(nir);
     nir_opt_dce(nir);
     nir_lower_explicit_io(nir, nir_var_mem_push_const, nir_address_format_32bit_offset);
     nir_opt_constant_folding(nir);
     nir_opt_dce(nir);
+    vk_optimize(nir);
+    if (mesa_stage != MESA_SHADER_COMPUTE && vk_loop_count(nir) && vk_bound_loop_limits(nir, MXGPU_VK_LOOP_BOUND))
+        vk_optimize(nir);
+    if (mesa_stage != MESA_SHADER_COMPUTE && vk_loop_count(nir)) {
+        fprintf(stderr, "mxgpu: %s shader has a loop with a data-dependent trip count, which cannot be lowered\n",
+                mesa_stage == MESA_SHADER_VERTEX ? "vertex" : "fragment");
+        ralloc_free(nir);
+        glsl_type_singleton_decref();
+        return -1;
+    }
     result = mxgpu_compile_nir(nir, mesa_stage == MESA_SHADER_FRAGMENT, compiled);
     ralloc_free(nir);
     glsl_type_singleton_decref();
@@ -1276,7 +1512,7 @@ static VkResult cache_insert(struct mx_pipeline_cache *cache, const uint8_t *key
     }
     memcpy(entry->key, key, size);
     entry->key_size = size;
-    entry->compiled = *compiled;
+    mxgpu_shader_copy(&entry->compiled, compiled);
     entry->next = NULL;
     struct mx_cache_entry **tail = &cache->entries;
     while (*tail)
@@ -1339,7 +1575,7 @@ static int cached_spirv_stage(struct mx_pipeline_cache *cache,
         pthread_mutex_lock(&cache->mutex);
         struct mx_cache_entry *entry = cache_find(cache, key, key_size);
         if (entry)
-            *compiled = entry->compiled;
+            mxgpu_shader_copy(compiled, &entry->compiled);
         pthread_mutex_unlock(&cache->mutex);
         if (entry) {
             free(key);
@@ -1398,7 +1634,7 @@ static VkResult cache_import_entry(struct mx_pipeline_cache *cache,
     struct mx_shader shader = {.spirv = 1, .len = shader_size};
     shader.bytes = malloc(shader_size);
     VkSpecializationMapEntry *maps = count ? calloc(count, sizeof *maps) : NULL;
-    struct mxgpu_shader *compiled = malloc(sizeof *compiled);
+    struct mxgpu_shader *compiled = calloc(1, sizeof *compiled);
     if (!shader.bytes || (count && !maps) || !compiled) {
         free(shader.bytes); free(maps); free(compiled);
         return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -1419,7 +1655,6 @@ static VkResult cache_import_entry(struct mx_pipeline_cache *cache,
         .flags = flags, .stage = stage_kind, .module = (VkShaderModule)&shader,
         .pName = (const char *)name, .pSpecializationInfo = count || data_size ? &spec : NULL
     };
-    memset(compiled, 0, sizeof *compiled);
     if (!compile_spirv_stage(&stage, compiled))
         result = cache_insert(cache, key, size, compiled);
 done:
@@ -1669,7 +1904,25 @@ static bool vk_pipeline_depth_state(struct mx_pipe *pipe, const VkPipelineDepthS
     return true;
 }
 
-static bool vk_pipeline_render_state(struct mx_pipe *pipe, const VkGraphicsPipelineCreateInfo *info)
+static bool vk_blend_target(const VkPipelineColorBlendAttachmentState *b, struct mxgpu_blend_target *target)
+{
+    target->enable = b->blendEnable;
+    target->write_mask = b->colorWriteMask;
+    if (target->write_mask & ~15u)
+        return false;
+    if (!target->enable)
+        return true;
+    target->src_color = vk_native_blend_factor(b->srcColorBlendFactor);
+    target->dst_color = vk_native_blend_factor(b->dstColorBlendFactor);
+    target->color_op = vk_native_blend_op(b->colorBlendOp);
+    target->src_alpha = vk_native_blend_factor(b->srcAlphaBlendFactor);
+    target->dst_alpha = vk_native_blend_factor(b->dstAlphaBlendFactor);
+    target->alpha_op = vk_native_blend_op(b->alphaBlendOp);
+    return target->src_color && target->dst_color && target->color_op &&
+           target->src_alpha && target->dst_alpha && target->alpha_op;
+}
+
+static bool vk_pipeline_render_state(struct mx_pipe *pipe, const VkGraphicsPipelineCreateInfo *info, uint32_t color_count)
 {
     struct mxgpu_native_render_state *state = &pipe->native_state;
     struct mxgpu_blend_target *target = &state->blend.targets[0];
@@ -1679,6 +1932,9 @@ static bool vk_pipeline_render_state(struct mx_pipe *pipe, const VkGraphicsPipel
     target->src_color = target->src_alpha = MXGPU_BLEND_ONE;
     target->dst_color = target->dst_alpha = MXGPU_BLEND_ZERO;
     target->color_op = target->alpha_op = MXGPU_BLEND_ADD;
+    pipe->color_count = color_count;
+    for (unsigned i = 0; i < MXGPU_VK_COLOR_ATTACHMENTS; i++)
+        pipe->blend_targets[i] = *target;
     state->rasterizer.fill_mode = MXGPU_FILL_SOLID;
     state->rasterizer.cull_mode = MXGPU_CULL_NONE;
     state->rasterizer.front_face = MXGPU_FRONT_COUNTERCLOCKWISE;
@@ -1694,30 +1950,25 @@ static bool vk_pipeline_render_state(struct mx_pipe *pipe, const VkGraphicsPipel
             case VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK: pipe->dynamic_stencil_compare = true; break;
             case VK_DYNAMIC_STATE_STENCIL_WRITE_MASK: pipe->dynamic_stencil_write = true; break;
             case VK_DYNAMIC_STATE_STENCIL_REFERENCE: pipe->dynamic_stencil_reference = true; break;
+            case VK_DYNAMIC_STATE_DEPTH_BIAS: pipe->dynamic_depth_bias = true; break;
+            case VK_DYNAMIC_STATE_LINE_WIDTH: pipe->dynamic_line_width = true; break;
+            case VK_DYNAMIC_STATE_DEPTH_BOUNDS: break;
             default: return false;
             }
         }
     }
     if (info->pColorBlendState) {
         const VkPipelineColorBlendStateCreateInfo *blend = info->pColorBlendState;
-        if (blend->logicOpEnable || blend->attachmentCount > 1 ||
+        if (blend->logicOpEnable || blend->attachmentCount > MXGPU_VK_COLOR_ATTACHMENTS ||
             (blend->attachmentCount && !blend->pAttachments))
             return false;
-        const VkPipelineColorBlendAttachmentState *b = blend->pAttachments;
-        target->enable = b && blend->attachmentCount && b->blendEnable;
-        target->write_mask = blend->attachmentCount ? b->colorWriteMask : 0;
-        if (target->write_mask & ~15u) return false;
-        if (target->enable) {
-            target->src_color = vk_native_blend_factor(b->srcColorBlendFactor);
-            target->dst_color = vk_native_blend_factor(b->dstColorBlendFactor);
-            target->color_op = vk_native_blend_op(b->colorBlendOp);
-            target->src_alpha = vk_native_blend_factor(b->srcAlphaBlendFactor);
-            target->dst_alpha = vk_native_blend_factor(b->dstAlphaBlendFactor);
-            target->alpha_op = vk_native_blend_op(b->alphaBlendOp);
-            if (!target->src_color || !target->dst_color || !target->color_op ||
-                !target->src_alpha || !target->dst_alpha || !target->alpha_op)
+        if (!blend->attachmentCount)
+            target->write_mask = 0;
+        for (uint32_t i = 0; i < blend->attachmentCount; i++)
+            if (!vk_blend_target(&blend->pAttachments[i], &pipe->blend_targets[i]))
                 return false;
-        }
+        if (blend->attachmentCount)
+            *target = pipe->blend_targets[0];
         for (unsigned i = 0; i < 4; i++) {
             state->blend_factor[i] = vk_float_bits(blend->blendConstants[i]);
             if (!mxgpu_f32_finite(state->blend_factor[i])) return false;
@@ -1725,7 +1976,13 @@ static bool vk_pipeline_render_state(struct mx_pipe *pipe, const VkGraphicsPipel
     }
     if (info->pRasterizationState) {
         const VkPipelineRasterizationStateCreateInfo *r = info->pRasterizationState;
-        if (r->rasterizerDiscardEnable || r->depthBiasEnable || r->lineWidth != 1.f ||
+        if (r->depthBiasEnable) {
+            pipe->depth_bias = true;
+            pipe->depth_bias_constant = r->depthBiasConstantFactor;
+            pipe->depth_bias_clamp = r->depthBiasClamp;
+            pipe->depth_bias_slope = r->depthBiasSlopeFactor;
+        }
+        if (r->rasterizerDiscardEnable || (r->lineWidth != 1.f && !pipe->dynamic_line_width) ||
             r->polygonMode != VK_POLYGON_MODE_FILL ||
             (r->cullMode != VK_CULL_MODE_NONE && r->cullMode != VK_CULL_MODE_FRONT_BIT &&
              r->cullMode != VK_CULL_MODE_BACK_BIT) ||
@@ -1767,14 +2024,22 @@ static VkResult create_pipelines(VkDevice device, VkPipelineCache cache, uint32_
     for (index = 0; index < count; index++) {
         struct mx_pipe *pipe = calloc(1, sizeof *pipe);
         uint32_t stage;
-        struct mxgpu_shader vs = {0}, fs = {0};
+        struct mxgpu_shader *vs = calloc(1, sizeof *vs), *fs = calloc(1, sizeof *fs);
         int have_vs = 0, have_fs = 0, spirv_failed = 0;
         struct mx_renderpass *pass = (struct mx_renderpass *)info[index].renderPass;
-        bool depth_only = pass && pass->color_attachment == VK_ATTACHMENT_UNUSED &&
-                          pass->depth_attachment != VK_ATTACHMENT_UNUSED;
-        if (!pipe)
+        const struct mx_subpass *subpass = pass && info[index].subpass < pass->subpass_count ?
+                                           &pass->subpasses[info[index].subpass] : NULL;
+        uint32_t used_colors = 0;
+        for (uint32_t c = 0; subpass && c < subpass->color_count; c++)
+            used_colors += subpass->colors[c] != VK_ATTACHMENT_UNUSED;
+        bool depth_only = subpass && !used_colors && subpass->depth != VK_ATTACHMENT_UNUSED;
+        if (!pipe || !vs || !fs) {
+            free(pipe);
+            free(vs);
+            free(fs);
             return VK_ERROR_OUT_OF_HOST_MEMORY;
-        if (!vk_pipeline_render_state(pipe, &info[index]))
+        }
+        if (!subpass || !vk_pipeline_render_state(pipe, &info[index], subpass->color_count))
             goto unsupported_vertex;
         if (depth_only)
             pipe->native_state.blend.targets[0].write_mask = 0;
@@ -1815,10 +2080,10 @@ static VkResult create_pipelines(VkDevice device, VkPipelineCache cache, uint32_
             const VkPipelineShaderStageCreateInfo *stage_info = &info[index].pStages[stage];
             if (shader && shader->spirv) {
                 if (stage_info->stage == VK_SHADER_STAGE_VERTEX_BIT) {
-                    have_vs = cached_spirv_stage((struct mx_pipeline_cache *)cache, stage_info, &vs) == 0;
+                    have_vs = cached_spirv_stage((struct mx_pipeline_cache *)cache, stage_info, vs) == 0;
                     spirv_failed |= !have_vs;
                 } else if (stage_info->stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
-                    have_fs = cached_spirv_stage((struct mx_pipeline_cache *)cache, stage_info, &fs) == 0;
+                    have_fs = cached_spirv_stage((struct mx_pipeline_cache *)cache, stage_info, fs) == 0;
                     spirv_failed |= !have_fs;
                 } else {
                     spirv_failed = 1;
@@ -1828,6 +2093,8 @@ static VkResult create_pipelines(VkDevice device, VkPipelineCache cache, uint32_
                 pipe->bytes = malloc(shader->len);
                 if (!pipe->bytes) {
                     free(pipe);
+                    free(vs);
+                    free(fs);
                     return VK_ERROR_OUT_OF_HOST_MEMORY;
                 }
                 memcpy(pipe->bytes, shader->bytes, shader->len);
@@ -1837,13 +2104,13 @@ static VkResult create_pipelines(VkDevice device, VkPipelineCache cache, uint32_
             }
         }
         if (have_vs && (have_fs || depth_only) && !spirv_failed) {
-            const struct mxgpu_shader *compiled_stages[2] = {&vs, &fs};
-            pipe->vertex_attribute_count = vs.vertex_attribute_count;
+            const struct mxgpu_shader *compiled_stages[2] = {vs, fs};
+            pipe->vertex_attribute_count = vs->vertex_attribute_count;
             if (pipe->vertex_attribute_count > MXGPU_SHADER_VERTEX_SLOTS)
                 goto unsupported_compiled;
-            memcpy(pipe->vertex_input_locations, vs.vertex_input_locations, sizeof pipe->vertex_input_locations);
-            pipe->vertex_builtins = vs.vertex_builtins;
-            pipe->vertex_builtin_slot = vs.vertex_builtin_slot;
+            memcpy(pipe->vertex_input_locations, vs->vertex_input_locations, sizeof pipe->vertex_input_locations);
+            pipe->vertex_builtins = vs->vertex_builtins;
+            pipe->vertex_builtin_slot = vs->vertex_builtin_slot;
             for (unsigned uniform_stage = 0; uniform_stage < 2; uniform_stage++) {
                 struct mx_uniform_stage *uniforms = &pipe->uniform_stages[uniform_stage];
                 const struct mxgpu_shader *compiled = compiled_stages[uniform_stage];
@@ -1852,11 +2119,11 @@ static VkResult create_pipelines(VkDevice device, VkPipelineCache cache, uint32_
                 uniforms->uniform_buffer_count = compiled->uniform_buffer_count;
                 memcpy(uniforms->uniform_buffers, compiled->uniform_buffers, sizeof uniforms->uniform_buffers);
             }
-            pipe->uses_texture = fs.samples;
+            pipe->uses_texture = fs->samples;
             pipe->reflected_texture = have_fs;
-            pipe->texture_binding = fs.texture_binding;
-            pipe->texture_set = fs.texture_set;
-            pipe->texture_element = fs.texture_element;
+            pipe->texture_binding = fs->texture_binding;
+            pipe->texture_set = fs->texture_set;
+            pipe->texture_element = fs->texture_element;
             free(pipe->bytes);
             pipe->bytes = NULL;
             pipe->len = 0;
@@ -1866,23 +2133,23 @@ static VkResult create_pipelines(VkDevice device, VkPipelineCache cache, uint32_
             (have_vs && !have_fs && !depth_only)) {
             free(pipe->bytes);
             free(pipe);
+            free(vs);
+            free(fs);
             result = VK_ERROR_INVALID_SHADER_NV;
             if (info[index].flags & VK_PIPELINE_CREATE_EARLY_RETURN_ON_FAILURE_BIT)
                 return result;
             continue;
         }
         if (have_vs) {
-            pipe->vertex_shader = malloc(sizeof vs);
-            if (have_fs)
-                pipe->fragment_shader = malloc(sizeof fs);
-            if (!pipe->vertex_shader || (have_fs && !pipe->fragment_shader)) {
-                free(pipe->vertex_shader); free(pipe->fragment_shader); free(pipe->bytes); free(pipe);
-                return VK_ERROR_OUT_OF_HOST_MEMORY;
+            pipe->vertex_shader = vs;
+            vs = NULL;
+            if (have_fs) {
+                pipe->fragment_shader = fs;
+                fs = NULL;
             }
-            *pipe->vertex_shader = vs;
-            if (have_fs)
-                *pipe->fragment_shader = fs;
         }
+        free(vs);
+        free(fs);
         pipe->layout = (struct mx_pipeline_layout *)info[index].layout;
         retain_layout(pipe->layout);
         out[index] = (VkPipeline)pipe;
@@ -1891,6 +2158,8 @@ unsupported_compiled:
         free(pipe->bytes);
 unsupported_vertex:
         free(pipe);
+        free(vs);
+        free(fs);
         result = VK_ERROR_FEATURE_NOT_PRESENT;
         if (info[index].flags & VK_PIPELINE_CREATE_EARLY_RETURN_ON_FAILURE_BIT)
             return result;
@@ -2005,32 +2274,40 @@ static VkResult create_fb(VkDevice device, const VkFramebufferCreateInfo *info, 
     if (!fb)
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     if (!pass || !info->width || !info->height || info->layers != 1 ||
-        (info->attachmentCount && !info->pAttachments))
+        info->attachmentCount != pass->attachment_count || (info->attachmentCount && !info->pAttachments))
         goto invalid;
-    if (pass && pass->color_attachment < info->attachmentCount && info->pAttachments)
-        fb->color = (struct mx_view *)info->pAttachments[pass->color_attachment];
-    if (pass->depth_attachment < info->attachmentCount && info->pAttachments)
-        fb->depth = (struct mx_view *)info->pAttachments[pass->depth_attachment];
-    if ((pass->color_attachment != VK_ATTACHMENT_UNUSED &&
-         (!fb->color || fb->color->format != pass->color_format ||
-          fb->color->width < info->width || fb->color->height < info->height)) ||
-        (pass->depth_attachment != VK_ATTACHMENT_UNUSED &&
-         (!fb->depth || fb->depth->format != pass->depth_format ||
-          fb->depth->width < info->width || fb->depth->height < info->height)))
-        goto invalid;
+    if (info->attachmentCount) {
+        fb->views = calloc(info->attachmentCount, sizeof *fb->views);
+        if (!fb->views) {
+            free(fb);
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+    }
+    fb->attachment_count = info->attachmentCount;
+    for (uint32_t i = 0; i < info->attachmentCount; i++) {
+        struct mx_view *view = (struct mx_view *)info->pAttachments[i];
+        if (!view || view->format != pass->attachments[i].format ||
+            view->width < info->width || view->height < info->height)
+            goto invalid;
+        fb->views[i] = view;
+    }
     fb->width = info->width;
     fb->height = info->height;
     *out = (VkFramebuffer)fb;
     return VK_SUCCESS;
 invalid:
+    free(fb->views);
     free(fb);
     return VK_ERROR_INITIALIZATION_FAILED;
 }
 
-static void destroy_fb(VkDevice device, VkFramebuffer fb, const VkAllocationCallbacks *alloc)
+static void destroy_fb(VkDevice device, VkFramebuffer handle, const VkAllocationCallbacks *alloc)
 {
+    struct mx_fb *fb = (struct mx_fb *)handle;
     (void)device;
     (void)alloc;
+    if (fb)
+        free(fb->views);
     free(fb);
 }
 
@@ -2094,6 +2371,8 @@ static VkResult alloc_cmds(VkDevice device, const VkCommandBufferAllocateInfo *i
             return VK_ERROR_OUT_OF_HOST_MEMORY;
         }
         set_loader_magic_value(cmd);
+        cmd->level = info->level;
+        cmd->line_width = 1.0f;
         cmd->pool = owner;
         cmd->next = owner->commands;
         owner->commands = cmd;
@@ -2108,6 +2387,7 @@ static VkResult reset_cmd(VkCommandBuffer command, VkCommandBufferResetFlags fla
     VK_LOADER_DATA loader_data = cmd->loader_data;
     struct mx_pool *pool = cmd->pool;
     struct mx_cmd *next = cmd->next;
+    VkCommandBufferLevel level = cmd->level;
     (void)flags;
     free_draws(cmd);
     free_bound_state(cmd);
@@ -2115,6 +2395,8 @@ static VkResult reset_cmd(VkCommandBuffer command, VkCommandBufferResetFlags fla
     cmd->loader_data = loader_data;
     cmd->pool = pool;
     cmd->next = next;
+    cmd->level = level;
+    cmd->line_width = 1.0f;
     return VK_SUCCESS;
 }
 
@@ -2128,60 +2410,204 @@ static VkResult reset_pool(VkDevice device, VkCommandPool pool, VkCommandPoolRes
     return VK_SUCCESS;
 }
 
+static void vk_bind_subpass(struct mx_cmd *cmd);
+
 static VkResult begin_cmd(VkCommandBuffer command, const VkCommandBufferBeginInfo *info)
 {
     struct mx_cmd *cmd = (struct mx_cmd *)command;
-    (void)info;
     reset_cmd(command, 0);
     cmd->open = 1;
+    if (cmd->level == VK_COMMAND_BUFFER_LEVEL_SECONDARY && info &&
+        (info->flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT)) {
+        const VkCommandBufferInheritanceInfo *inherit = info->pInheritanceInfo;
+        struct mx_renderpass *pass = inherit ? (struct mx_renderpass *)inherit->renderPass : NULL;
+        if (!pass || inherit->subpass >= pass->subpass_count) {
+            cmd->open = 0;
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        cmd->pass = pass;
+        cmd->subpass = inherit->subpass;
+        cmd->fb = (struct mx_fb *)inherit->framebuffer;
+        if (cmd->fb && cmd->fb->attachment_count != pass->attachment_count)
+            cmd->fb = NULL;
+        vk_bind_subpass(cmd);
+        cmd->color_count = pass->subpasses[cmd->subpass].color_count;
+    }
     return VK_SUCCESS;
+}
+
+static struct mx_draw *append_operation(struct mx_cmd *cmd, int kind)
+{
+    if (cmd->record_result != VK_SUCCESS)
+        return NULL;
+    if (!cmd->open) {
+        cmd->record_result = VK_ERROR_DEVICE_LOST;
+        return NULL;
+    }
+    struct mx_draw *operation = calloc(1, sizeof *operation);
+    if (!operation) {
+        cmd->record_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+        return NULL;
+    }
+    operation->operation = kind;
+    if (cmd->last_draw)
+        cmd->last_draw->next = operation;
+    else
+        cmd->draws = operation;
+    cmd->last_draw = operation;
+    return operation;
+}
+
+static void copy_target_state(struct mx_cmd *target, const struct mx_cmd *source)
+{
+    target->fb = source->fb;
+    target->pass = source->pass;
+    target->subpass = source->subpass;
+    target->render_area = source->render_area;
+    memcpy(target->colors, source->colors, sizeof target->colors);
+    target->color_count = source->color_count;
+    target->depth_view = source->depth_view;
+}
+
+static void vk_bind_subpass(struct mx_cmd *cmd)
+{
+    const struct mx_subpass *subpass = &cmd->pass->subpasses[cmd->subpass];
+    memset(cmd->colors, 0, sizeof cmd->colors);
+    cmd->color_count = subpass->color_count;
+    cmd->depth_view = NULL;
+    for (uint32_t c = 0; cmd->fb && c < subpass->color_count; c++)
+        if (subpass->colors[c] != VK_ATTACHMENT_UNUSED)
+            cmd->colors[c] = cmd->fb->views[subpass->colors[c]];
+    if (cmd->fb && subpass->depth != VK_ATTACHMENT_UNUSED)
+        cmd->depth_view = cmd->fb->views[subpass->depth];
+}
+
+static void vk_subpass_loads(struct mx_cmd *cmd, const VkClearValue *values, uint32_t value_count)
+{
+    const struct mx_renderpass *pass = cmd->pass;
+    for (uint32_t a = 0; a < pass->attachment_count; a++) {
+        const VkAttachmentDescription *attachment = &pass->attachments[a];
+        VkImageAspectFlags aspects = 0, available = mx_vk_format_aspects(attachment->format);
+        if (pass->first_subpass[a] != cmd->subpass)
+            continue;
+        if ((available & VK_IMAGE_ASPECT_COLOR_BIT) && attachment->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR)
+            aspects |= VK_IMAGE_ASPECT_COLOR_BIT;
+        if ((available & VK_IMAGE_ASPECT_DEPTH_BIT) && attachment->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR)
+            aspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
+        if ((available & VK_IMAGE_ASPECT_STENCIL_BIT) && attachment->stencilLoadOp == VK_ATTACHMENT_LOAD_OP_CLEAR)
+            aspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
+        if (!aspects)
+            continue;
+        if (!values || a >= value_count) {
+            cmd->record_result = VK_ERROR_DEVICE_LOST;
+            return;
+        }
+        struct mx_draw *clear = append_operation(cmd, MX_OP_CLEAR_VIEW);
+        if (!clear)
+            return;
+        clear->state.fb = cmd->fb;
+        clear->clear_view = cmd->fb->views[a];
+        clear->clear_aspects = aspects;
+        clear->clear_value = values[a];
+        clear->clear_rect = cmd->render_area;
+    }
 }
 
 static void cmd_begin_rp(VkCommandBuffer command, const VkRenderPassBeginInfo *info, VkSubpassContents contents)
 {
     struct mx_cmd *cmd = (struct mx_cmd *)command;
     struct mx_renderpass *pass = (struct mx_renderpass *)info->renderPass;
+    struct mx_fb *fb = (struct mx_fb *)info->framebuffer;
     (void)contents;
-    cmd->fb = (struct mx_fb *)info->framebuffer;
-    bool color_clear = pass && pass->color_attachment != VK_ATTACHMENT_UNUSED && pass->load == VK_ATTACHMENT_LOAD_OP_CLEAR;
-    VkImageAspectFlags depth_clear = 0;
-    if (pass && pass->depth_attachment != VK_ATTACHMENT_UNUSED) {
-        if (pass->depth_load == VK_ATTACHMENT_LOAD_OP_CLEAR) depth_clear |= VK_IMAGE_ASPECT_DEPTH_BIT;
-        if (pass->stencil_load == VK_ATTACHMENT_LOAD_OP_CLEAR)
-            depth_clear |= mx_vk_format_aspects(pass->depth_format) & VK_IMAGE_ASPECT_STENCIL_BIT;
-    }
-    if (!cmd->open || !pass || !cmd->fb ||
-        ((color_clear || depth_clear) && !info->pClearValues) ||
-        (color_clear && pass->color_attachment >= info->clearValueCount) ||
-        (depth_clear && pass->depth_attachment >= info->clearValueCount)) {
+    if (cmd->record_result != VK_SUCCESS)
+        return;
+    if (!cmd->open || !pass || !fb || fb->attachment_count != pass->attachment_count || cmd->pass) {
         cmd->record_result = VK_ERROR_DEVICE_LOST;
         return;
     }
-    if ((color_clear || depth_clear) && cmd->record_result == VK_SUCCESS) {
-        struct mx_draw *clear = calloc(1, sizeof *clear);
-        if (!clear) {
+    free(cmd->clear_values);
+    cmd->clear_values = NULL;
+    cmd->clear_value_count = 0;
+    if (info->clearValueCount && info->pClearValues) {
+        cmd->clear_values = malloc((size_t)info->clearValueCount * sizeof *cmd->clear_values);
+        if (!cmd->clear_values) {
             cmd->record_result = VK_ERROR_OUT_OF_HOST_MEMORY;
             return;
         }
-        clear->state.fb = cmd->fb;
-        clear->state.clear = color_clear;
-        if (color_clear)
-            clear->state.clear_color = info->pClearValues[pass->color_attachment].color;
-        clear->state.clear_depth_aspects = depth_clear;
-        if (depth_clear)
-            clear->state.clear_depth = info->pClearValues[pass->depth_attachment].depthStencil;
-        clear->state.clear_area = info->renderArea;
-        if (cmd->last_draw)
-            cmd->last_draw->next = clear;
-        else
-            cmd->draws = clear;
-        cmd->last_draw = clear;
+        memcpy(cmd->clear_values, info->pClearValues, (size_t)info->clearValueCount * sizeof *cmd->clear_values);
+        cmd->clear_value_count = info->clearValueCount;
     }
+    cmd->fb = fb;
+    cmd->pass = pass;
+    cmd->subpass = 0;
+    cmd->render_area = info->renderArea;
+    vk_bind_subpass(cmd);
+    vk_subpass_loads(cmd, cmd->clear_values, cmd->clear_value_count);
+}
+
+static void cmd_next_subpass(VkCommandBuffer command, VkSubpassContents contents)
+{
+    struct mx_cmd *cmd = (struct mx_cmd *)command;
+    (void)contents;
+    if (cmd->record_result != VK_SUCCESS)
+        return;
+    if (!cmd->open || !cmd->pass || cmd->subpass + 1 >= cmd->pass->subpass_count) {
+        cmd->record_result = VK_ERROR_DEVICE_LOST;
+        return;
+    }
+    cmd->subpass++;
+    vk_bind_subpass(cmd);
+    vk_subpass_loads(cmd, cmd->clear_values, cmd->clear_value_count);
 }
 
 static void cmd_end_rp(VkCommandBuffer command)
 {
-    (void)command;
+    struct mx_cmd *cmd = (struct mx_cmd *)command;
+    if (cmd->record_result == VK_SUCCESS && (!cmd->pass || cmd->subpass + 1 != cmd->pass->subpass_count))
+        cmd->record_result = VK_ERROR_DEVICE_LOST;
+    cmd->pass = NULL;
+    cmd->subpass = 0;
+    free(cmd->clear_values);
+    cmd->clear_values = NULL;
+    cmd->clear_value_count = 0;
+    memset(cmd->colors, 0, sizeof cmd->colors);
+    cmd->color_count = 0;
+    cmd->depth_view = NULL;
+}
+
+static void cmd_clear_attachments(VkCommandBuffer command, uint32_t attachment_count, const VkClearAttachment *attachments,
+                                  uint32_t rect_count, const VkClearRect *rects)
+{
+    struct mx_cmd *cmd = (struct mx_cmd *)command;
+    if (cmd->record_result != VK_SUCCESS)
+        return;
+    if (!cmd->pass || (attachment_count && !attachments) || (rect_count && !rects)) {
+        cmd->record_result = VK_ERROR_DEVICE_LOST;
+        return;
+    }
+    for (uint32_t i = 0; i < attachment_count; i++) {
+        const VkClearAttachment *attachment = &attachments[i];
+        bool color = attachment->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT;
+        if ((color && (attachment->aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+                       attachment->colorAttachment >= cmd->color_count)) || !attachment->aspectMask) {
+            cmd->record_result = VK_ERROR_DEVICE_LOST;
+            return;
+        }
+        for (uint32_t r = 0; r < rect_count; r++) {
+            if (rects[r].baseArrayLayer || rects[r].layerCount != 1) {
+                cmd->record_result = VK_ERROR_DEVICE_LOST;
+                return;
+            }
+            struct mx_draw *clear = append_operation(cmd, MX_OP_CLEAR_VIEW);
+            if (!clear)
+                return;
+            copy_target_state(&clear->state, cmd);
+            clear->clear_aspects = attachment->aspectMask;
+            clear->clear_value = attachment->clearValue;
+            clear->clear_rect = rects[r].rect;
+            clear->clear_slot = color ? attachment->colorAttachment : MXGPU_VK_COLOR_ATTACHMENTS;
+        }
+    }
 }
 
 static void cmd_bind_pipe(VkCommandBuffer command, VkPipelineBindPoint point, VkPipeline pipeline)
@@ -2253,11 +2679,52 @@ static void cmd_set_stencil_reference(VkCommandBuffer command, VkStencilFaceFlag
     vk_set_stencil_values(cmd, faces, value, cmd->stencil_ref, &cmd->stencil_ref_set);
 }
 
+static void cmd_set_depth_bias(VkCommandBuffer command, float constant, float clamp, float slope)
+{
+    struct mx_cmd *cmd = (struct mx_cmd *)command;
+    if (!cmd->open) { cmd->record_result = VK_ERROR_DEVICE_LOST; return; }
+    cmd->depth_bias[0] = constant;
+    cmd->depth_bias[1] = clamp;
+    cmd->depth_bias[2] = slope;
+    cmd->depth_bias_set = true;
+}
+
+static void cmd_set_line_width(VkCommandBuffer command, float width)
+{
+    struct mx_cmd *cmd = (struct mx_cmd *)command;
+    if (!cmd->open || width != 1.0f) { cmd->record_result = VK_ERROR_DEVICE_LOST; return; }
+    cmd->line_width = width;
+}
+
+static void cmd_set_depth_bounds(VkCommandBuffer command, float minimum, float maximum)
+{
+    struct mx_cmd *cmd = (struct mx_cmd *)command;
+    if (!cmd->open || !(minimum >= 0.0f && minimum <= 1.0f) || !(maximum >= 0.0f && maximum <= 1.0f)) {
+        cmd->record_result = VK_ERROR_DEVICE_LOST;
+        return;
+    }
+    cmd->depth_bounds[0] = minimum;
+    cmd->depth_bounds[1] = maximum;
+}
+
 static bool vk_draw_render_state(struct mx_cmd *cmd, uint32_t width, uint32_t height,
                                   struct mxgpu_native_render_state *state)
 {
     struct mx_pipe *pipe = cmd->pipe;
     *state = pipe->native_state;
+    if (pipe->depth_bias) {
+        float bias[3] = {pipe->depth_bias_constant, pipe->depth_bias_clamp, pipe->depth_bias_slope};
+        if (pipe->dynamic_depth_bias) {
+            if (!cmd->depth_bias_set) return false;
+            memcpy(bias, cmd->depth_bias, sizeof bias);
+        }
+        if (!(bias[0] >= -2147483648.0f && bias[0] < 2147483648.0f)) return false;
+        state->rasterizer.depth_bias = (int32_t)lrintf(bias[0]);
+        state->rasterizer.depth_bias_clamp = vk_float_bits(bias[1]);
+        state->rasterizer.slope_scaled_depth_bias = vk_float_bits(bias[2]);
+        if (!mxgpu_f32_finite(state->rasterizer.depth_bias_clamp) ||
+            !mxgpu_f32_finite(state->rasterizer.slope_scaled_depth_bias)) return false;
+    }
     state->depth_enabled = pipe->depth_enabled;
     state->depth_stencil = pipe->depth_stencil;
     state->stencil_reference = pipe->stencil_reference;
@@ -2470,6 +2937,8 @@ static struct mx_draw *record_snapshot(struct mx_cmd *cmd, struct mx_set **sets,
     draw->state.compute_sets = NULL;
     draw->state.compute_offsets = NULL;
     draw->state.compute_set_count = 0;
+    draw->state.clear_values = NULL;
+    draw->state.clear_value_count = 0;
     if (set_count) {
         draw->state.bound_sets = malloc((size_t)set_count * sizeof *sets);
         if (!draw->state.bound_sets) {
@@ -3161,6 +3630,23 @@ static void vk_free_texture_inputs(uint8_t *storage[MXGPU_TEXTURE_INPUTS])
     for (unsigned i = 0; i < MXGPU_TEXTURE_INPUTS; i++) free(storage[i]);
 }
 
+static const struct mx_descriptor *vk_find_descriptor(struct mx_cmd *cmd, unsigned set_index, unsigned binding,
+                                                      unsigned element)
+{
+    struct mx_set *set = NULL;
+    if (cmd->bound_set_count) {
+        if (set_index >= cmd->bound_set_count)
+            return NULL;
+        set = cmd->bound_sets[set_index];
+    } else if (!set_index) {
+        set = cmd->set;
+    }
+    for (unsigned j = 0; set && j < set->descriptor_count; j++)
+        if (set->descriptors[j].binding == binding && set->descriptors[j].element == element)
+            return &set->descriptors[j];
+    return NULL;
+}
+
 static VkResult vk_collect_texture_inputs(struct mx_cmd *cmd,
                                            struct mxgpu_texture_input inputs[MXGPU_TEXTURE_INPUTS],
                                            uint8_t *storage[MXGPU_TEXTURE_INPUTS], uint32_t *count)
@@ -3170,17 +3656,22 @@ static VkResult vk_collect_texture_inputs(struct mx_cmd *cmd,
     if (*count > MXGPU_TEXTURE_INPUTS) return VK_ERROR_DEVICE_LOST;
     for (unsigned i = 0; i < *count; i++) {
         const struct mxgpu_texture_binding *binding = &shader->textures[i];
-        struct mx_set *set = NULL;
-        if (cmd->bound_set_count) {
-            if (binding->set >= cmd->bound_set_count) goto invalid;
-            set = cmd->bound_sets[binding->set];
-        } else if (!binding->set) set = cmd->set;
-        if (!set) goto invalid;
-        const struct mx_descriptor *descriptor = NULL;
-        for (unsigned j = 0; j < set->descriptor_count; j++)
-            if (set->descriptors[j].binding == binding->binding && set->descriptors[j].element == binding->element)
-                descriptor = &set->descriptors[j];
-        if (!descriptor || descriptor->type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) goto invalid;
+        const struct mx_descriptor *descriptor = vk_find_descriptor(cmd, binding->set, binding->binding, binding->element);
+        const struct mx_sampler *sampler = NULL;
+        if (!descriptor)
+            goto invalid;
+        if (binding->separate_sampler) {
+            const struct mx_descriptor *sampler_descriptor = vk_find_descriptor(cmd, binding->sampler_set,
+                binding->sampler_binding, binding->sampler_element);
+            if (descriptor->type != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || !sampler_descriptor ||
+                sampler_descriptor->type != VK_DESCRIPTOR_TYPE_SAMPLER)
+                goto invalid;
+            sampler = (const struct mx_sampler *)sampler_descriptor->value.image.sampler;
+        } else if (descriptor->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+            sampler = (const struct mx_sampler *)descriptor->value.image.sampler;
+        } else if (descriptor->type != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) {
+            goto invalid;
+        }
         struct mx_view *view = (struct mx_view *)descriptor->value.image.imageView;
         struct mx_img *image = view ? view->image : NULL;
         if (!view || !image || !image->mem || !image->mem->ptr ||
@@ -3190,9 +3681,17 @@ static VkResult vk_collect_texture_inputs(struct mx_cmd *cmd,
             goto invalid;
         VkDeviceSize offset = image->offset + view->offset;
         VkDeviceSize bytes = (VkDeviceSize)view->width * view->height * vk_format_bytes(view->format);
-        if (bytes > image->mem->size - offset ||
-            !vk_native_sampler((struct mx_sampler *)descriptor->value.image.sampler, &inputs[i].sampler))
+        if (bytes > image->mem->size - offset)
             goto invalid;
+        if (sampler) {
+            if (!vk_native_sampler(sampler, &inputs[i].sampler))
+                goto invalid;
+        } else {
+            inputs[i].sampler = (struct mxgpu_sampler_state){.sampler_id = 1, .min_filter = MXGPU_FILTER_NEAREST,
+                .mag_filter = MXGPU_FILTER_NEAREST, .mip_filter = MXGPU_FILTER_NEAREST,
+                .address_u = MXGPU_ADDRESS_CLAMP_TO_EDGE, .address_v = MXGPU_ADDRESS_CLAMP_TO_EDGE,
+                .address_w = MXGPU_ADDRESS_CLAMP_TO_EDGE, .max_anisotropy = 1};
+        }
         inputs[i].width = view->width;
         inputs[i].height = view->height;
         inputs[i].texture_slot = binding->texture_slot;
@@ -3268,64 +3767,6 @@ static void vk_commit_attachment(struct mx_view *view, uint32_t width, uint32_t 
         else
             memcpy(destination + (size_t)y * view->width * bpp, pixels + (size_t)y * width * bpp, (size_t)width * bpp);
     }
-}
-
-static VkResult vk_clear_attachments(struct mx_cmd *cmd)
-{
-    struct mx_view *color_view = cmd->fb ? cmd->fb->color : NULL;
-    struct mx_view *depth_view = cmd->fb ? cmd->fb->depth : NULL;
-    uint8_t *color_data = NULL, *depth_data = NULL;
-    if (!cmd->fb ||
-        (cmd->clear && (!color_view || vk_color_format(color_view->format) == PIPE_FORMAT_NONE ||
-                       vk_view_backing(color_view, &color_data) != VK_SUCCESS)) ||
-        (cmd->clear_depth_aspects && (!depth_view ||
-          (cmd->clear_depth_aspects & ~mx_vk_format_aspects(depth_view->format)) ||
-          vk_view_backing(depth_view, &depth_data) != VK_SUCCESS)))
-        return VK_ERROR_DEVICE_LOST;
-    uint32_t depth_bits = 0;
-    if (cmd->clear_depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
-        float depth = cmd->clear_depth.depth;
-        if (!mxgpu_f32_finite(vk_float_bits(depth)) || depth < 0 || depth > 1)
-            return VK_ERROR_DEVICE_LOST;
-        depth_bits = depth_view->format == VK_FORMAT_D24_UNORM_S8_UINT ?
-            (uint32_t)((double)depth * 16777215.0 + 0.5) : vk_float_bits(depth);
-    }
-    uint8_t rgba[4];
-    for (unsigned c = 0; c < 4; c++) {
-        float value = cmd->clear_color.float32[c];
-        rgba[c] = !(value > 0.f) ? 0 : value >= 1.f ? 255 : (uint8_t)(value * 255.f + 0.5f);
-    }
-    uint8_t packed_color[4];
-    unsigned color_bpp = color_data ? vk_format_bytes(color_view->format) : 0;
-    if (color_data)
-        util_format_pack_description(vk_color_format(color_view->format))->pack_rgba_8unorm(packed_color, 0, rgba, 0, 1, 1);
-    int64_t left = cmd->clear_area.offset.x, top = cmd->clear_area.offset.y;
-    int64_t right = left + cmd->clear_area.extent.width, bottom = top + cmd->clear_area.extent.height;
-    left = left < 0 ? 0 : left;
-    top = top < 0 ? 0 : top;
-    right = right > cmd->fb->width ? cmd->fb->width : right;
-    bottom = bottom > cmd->fb->height ? cmd->fb->height : bottom;
-    for (int64_t y = top; y < bottom; y++) {
-        for (int64_t x = left; x < right; x++) {
-            if (color_data)
-                memcpy(color_data + ((size_t)y * color_view->width + x) * color_bpp, packed_color, color_bpp);
-            if (depth_data) {
-                unsigned bpp = vk_format_bytes(depth_view->format);
-                uint8_t *pixel = depth_data + ((size_t)y * depth_view->width + x) * bpp;
-                if (cmd->clear_depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
-                    if (depth_view->format == VK_FORMAT_D24_UNORM_S8_UINT)
-                        mx_w32(pixel, 0, (mx_r32(pixel, 0) & 0xff000000u) | depth_bits);
-                    else
-                        mx_w32(pixel, 0, depth_bits);
-                }
-                if (cmd->clear_depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)
-                    pixel[depth_view->format == VK_FORMAT_D24_UNORM_S8_UINT ? 3 : 4] = cmd->clear_depth.stencil;
-                if (bpp == 8)
-                    memset(pixel + 5, 0, 3);
-            }
-        }
-    }
-    return VK_SUCCESS;
 }
 
 static VkResult perform_draw(struct mx_cmd *cmd);
@@ -3513,31 +3954,75 @@ done:
     return result;
 }
 
+static float vk_bits_float(uint32_t bits)
+{
+    float value;
+    memcpy(&value, &bits, sizeof value);
+    return value;
+}
+
+static VkResult vk_link_draw(struct mx_cmd *cmd, const struct mxgpu_texture_input *inputs, uint32_t texture_count,
+                             const struct mxgpu_viewport *viewport, unsigned output, uint8_t **module,
+                             uint32_t *module_len)
+{
+    float x = vk_bits_float(viewport->x), y = vk_bits_float(viewport->y);
+    float width = vk_bits_float(viewport->width), height = vk_bits_float(viewport->height);
+    float near = vk_bits_float(viewport->min_depth), far = vk_bits_float(viewport->max_depth);
+    const float terms[MXGPU_VIEWPORT_TERMS] = {width * 0.5f, x + width * 0.5f, -height * 0.5f, y + height * 0.5f,
+                                               far - near, near};
+    uint32_t sampler_compare[MXGPU_TEXTURE_INPUTS] = {0}, extents[2 * MXGPU_TEXTURE_INPUTS] = {0};
+    *module = malloc(MXGPU_LINK_MODULE_CAPACITY);
+    if (!*module)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    for (uint32_t i = 0; i < texture_count; i++) {
+        sampler_compare[i] = inputs[i].sampler.compare;
+        extents[2 * i] = inputs[i].width;
+        extents[2 * i + 1] = inputs[i].height;
+    }
+    if (mxgpu_link_shaders_draw_output(cmd->pipe->vertex_shader, cmd->pipe->fragment_shader, cmd->vertex_count,
+                                       texture_count != 0, *module, MXGPU_LINK_MODULE_CAPACITY, module_len,
+                                       sampler_compare, output, extents, terms)) {
+        free(*module);
+        *module = NULL;
+        return VK_ERROR_DEVICE_LOST;
+    }
+    return VK_SUCCESS;
+}
+
+static bool vk_native_state_required(const struct mxgpu_native_render_state *state, uint32_t width, uint32_t height)
+{
+    return state->depth_enabled || state->blend.targets[0].enable || state->blend.targets[0].write_mask != 15 ||
+        state->rasterizer.cull_mode != MXGPU_CULL_NONE || !state->rasterizer.depth_clip_enable ||
+        state->rasterizer.depth_bias || state->rasterizer.slope_scaled_depth_bias ||
+        state->viewport.x || state->viewport.y != vk_float_bits((float)height) ||
+        state->viewport.width != vk_float_bits((float)width) ||
+        state->viewport.height != vk_float_bits(-(float)height) ||
+        state->viewport.min_depth || state->viewport.max_depth != vk_float_bits(1.f) ||
+        state->scissor.left || state->scissor.top || state->scissor.right != width || state->scissor.bottom != height;
+}
+
 static VkResult perform_draw(struct mx_cmd *cmd)
 {
     uint8_t white[4] = {255, 255, 255, 255};
     struct mx_mem fallback_mem = {.size = 4, .ptr = white};
     struct mx_img fallback_img = {.width = 1, .height = 1, .mem = &fallback_mem, .size = 4, .format = VK_FORMAT_R8G8B8A8_UNORM};
     struct mx_view fallback_view = {.image = &fallback_img, .width = 1, .height = 1, .format = VK_FORMAT_R8G8B8A8_UNORM};
-    unsigned char *color;
     struct mx_img *tex;
-    struct mx_img *dst;
-    struct mx_view *tv, *dv;
-    VkDeviceSize tex_offset, dst_offset;
-    const float *verts;
-    VkDeviceSize vertex_bytes, texture_bytes, color_bytes, vertex_offset;
-    VkDeviceSize binding_offset;
-    if (cmd->draw && !cmd->clear && !cmd->clear_depth_aspects && cmd->vertex_count && !cmd->packed_vertices)
+    struct mx_view *tv;
+    VkDeviceSize tex_offset, vertex_bytes, texture_bytes, vertex_offset, binding_offset;
+    if (cmd->draw && cmd->vertex_count && !cmd->pipe) {
+        static atomic_int reported;
+        if (!atomic_exchange(&reported, 1))
+            fprintf(stderr, "mxgpu: draw recorded without a valid graphics pipeline was skipped\n");
+        return VK_SUCCESS;
+    }
+    if (cmd->draw && cmd->vertex_count && !cmd->packed_vertices)
         return perform_vertex_draw(cmd);
-    if (cmd->clear || cmd->clear_depth_aspects)
-        return vk_clear_attachments(cmd);
     if (!cmd->draw || !cmd->vertex_count)
         return VK_SUCCESS;
-    if (!cmd->pipe || (!cmd->pipe->bytes && !cmd->pipe->vertex_shader) || !cmd->vbo || !cmd->vbo->mem ||
-        !cmd->fb || (!cmd->fb->color && !cmd->fb->depth))
+    if ((!cmd->pipe->bytes && !cmd->pipe->vertex_shader) || !cmd->vbo || !cmd->vbo->mem || !cmd->fb)
         return VK_ERROR_DEVICE_LOST;
     if (cmd->pipe->uses_texture) {
-        uint32_t i;
         struct mx_set *set = cmd->set;
         if (cmd->pipe->reflected_texture && cmd->bound_set_count) {
             if (cmd->pipe->texture_set >= cmd->bound_set_count)
@@ -3551,7 +4036,7 @@ static VkResult perform_draw(struct mx_cmd *cmd)
         tv = set->image;
         if (cmd->pipe->reflected_texture) {
             tv = NULL;
-            for (i = 0; i < set->descriptor_count; i++) {
+            for (uint32_t i = 0; i < set->descriptor_count; i++) {
                 struct mx_descriptor *descriptor = &set->descriptors[i];
                 if (descriptor->binding == cmd->pipe->texture_binding &&
                     descriptor->element == cmd->pipe->texture_element)
@@ -3563,165 +4048,1314 @@ static VkResult perform_draw(struct mx_cmd *cmd)
     } else {
         tv = &fallback_view;
     }
-    dv = cmd->fb->color;
     tex = tv->image;
-    dst = dv ? dv->image : NULL;
     uint32_t render_width = cmd->fb->width, render_height = cmd->fb->height;
-    if (!tex || !tex->mem || (dv && (!dst || !dst->mem)) || !tv->width ||
-        !tv->height || !render_width || !render_height ||
-        tv->width > INT32_MAX || tv->height > INT32_MAX ||
-        render_width > INT32_MAX || render_height > INT32_MAX ||
-        cmd->vertex_count > INT32_MAX)
-        return VK_ERROR_DEVICE_LOST;
-    if (tv->offset > UINT64_MAX - tex->offset || (dv && dv->offset > UINT64_MAX - dst->offset))
+    if (!tex || !tex->mem || !tv->width || !tv->height || !render_width || !render_height ||
+        tv->width > INT32_MAX || tv->height > INT32_MAX || render_width > INT32_MAX || render_height > INT32_MAX ||
+        cmd->vertex_count > INT32_MAX || tv->offset > UINT64_MAX - tex->offset)
         return VK_ERROR_DEVICE_LOST;
     tex_offset = tex->offset + tv->offset;
-    dst_offset = dv ? dst->offset + dv->offset : 0;
     uint32_t stride_bytes = (cmd->pipe->vertex_attribute_count ? cmd->pipe->vertex_attribute_count : 1) * 16;
     vertex_bytes = (VkDeviceSize)cmd->vertex_count * stride_bytes;
     binding_offset = (VkDeviceSize)cmd->first_vertex * stride_bytes;
     if (cmd->voff > UINT64_MAX - binding_offset)
         return VK_ERROR_DEVICE_LOST;
     binding_offset += cmd->voff;
-    unsigned texture_bpp = vk_format_bytes(tv->format);
-    unsigned color_bpp = dv ? vk_format_bytes(dv->format) : 4;
-    if (vk_color_format(tv->format) == PIPE_FORMAT_NONE ||
-        (dv && vk_color_format(dv->format) == PIPE_FORMAT_NONE))
+    if (vk_color_format(tv->format) == PIPE_FORMAT_NONE)
         return VK_ERROR_FEATURE_NOT_PRESENT;
-    texture_bytes = (VkDeviceSize)tv->width * tv->height * texture_bpp;
-    color_bytes = (VkDeviceSize)render_width * render_height * 4u;
+    texture_bytes = (VkDeviceSize)tv->width * tv->height * vk_format_bytes(tv->format);
     if (binding_offset > cmd->vbo->size || vertex_bytes > cmd->vbo->size - binding_offset ||
-        cmd->vbo->offset > cmd->vbo->mem->size ||
-        binding_offset > cmd->vbo->mem->size - cmd->vbo->offset)
+        cmd->vbo->offset > cmd->vbo->mem->size || binding_offset > cmd->vbo->mem->size - cmd->vbo->offset)
         return VK_ERROR_DEVICE_LOST;
     vertex_offset = cmd->vbo->offset + binding_offset;
-    if (vertex_bytes > cmd->vbo->mem->size - vertex_offset ||
-        tex_offset > tex->mem->size || texture_bytes > tex->mem->size - tex_offset ||
-        (dv && (dst_offset > dst->mem->size ||
-          (VkDeviceSize)render_width * render_height * color_bpp > dst->mem->size - dst_offset || !dst->mem->ptr)) ||
-        color_bytes > SIZE_MAX || !cmd->vbo->mem->ptr || !tex->mem->ptr)
+    if (vertex_bytes > cmd->vbo->mem->size - vertex_offset || tex_offset > tex->mem->size ||
+        texture_bytes > tex->mem->size - tex_offset || (VkDeviceSize)render_width * render_height > SIZE_MAX / 4u ||
+        !cmd->vbo->mem->ptr || !tex->mem->ptr)
         return VK_ERROR_DEVICE_LOST;
-    if (dv) {
-        VkResult color_result = vk_stage_attachment(dv, render_width, render_height, &color);
-        if (color_result != VK_SUCCESS)
-            return color_result;
-    } else {
-        color = calloc(1, (size_t)color_bytes);
-        if (!color)
-            return VK_ERROR_OUT_OF_HOST_MEMORY;
+    const struct mxgpu_shader *fs = cmd->pipe->fragment_shader;
+    uint32_t written = !cmd->pipe->vertex_shader ? 1u : fs ? (fs->color_output_mask ? fs->color_output_mask : 1u) : 0u;
+    uint32_t passes[MXGPU_VK_COLOR_ATTACHMENTS], pass_count = 0;
+    for (uint32_t c = 0; c < cmd->color_count && c < MXGPU_VK_COLOR_ATTACHMENTS; c++) {
+        struct mx_view *view = cmd->colors[c];
+        uint8_t *backing;
+        if (!view || !(written & (1u << c)))
+            continue;
+        if (vk_color_format(view->format) == PIPE_FORMAT_NONE)
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        if (vk_view_backing(view, &backing) != VK_SUCCESS || view->width < render_width || view->height < render_height)
+            return VK_ERROR_DEVICE_LOST;
+        if (c >= cmd->pipe->color_count || !(cmd->pipe->blend_targets[c].write_mask & vk_color_write_mask(view->format)))
+            continue;
+        if (!cmd->pipe->vertex_shader && c)
+            continue;
+        passes[pass_count++] = c;
     }
-    verts = (const float *)((unsigned char *)cmd->vbo->mem->ptr + vertex_offset);
+    bool depth = cmd->depth_view && cmd->pipe->depth_enabled;
+    bool occlusion = cmd->occlusion_pool != NULL;
+    if (!pass_count && !depth && !occlusion)
+        return VK_SUCCESS;
+    if (occlusion && !cmd->pipe->vertex_shader)
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    const float *verts = (const float *)((unsigned char *)cmd->vbo->mem->ptr + vertex_offset);
     uint8_t *uniform_data[2] = {NULL, NULL};
     uint32_t uniform_size[2] = {0, 0};
-    VkResult uniform_result = collect_uniforms(cmd, 0, &uniform_data[0], &uniform_size[0]);
-    if (uniform_result == VK_SUCCESS)
-        uniform_result = collect_uniforms(cmd, 1, &uniform_data[1], &uniform_size[1]);
-    if (uniform_result != VK_SUCCESS) {
-        free(uniform_data[0]);
-        free(uniform_data[1]);
-        free(color);
-        return uniform_result;
-    }
+    uint8_t *mapped_texels = NULL, *depth_pixels = NULL, *depth_original = NULL, *color = NULL, *module = NULL;
     const uint8_t *texels;
-    uint8_t *mapped_texels;
-    VkResult mapping_result = stage_view_texture(tv, (const uint8_t *)tex->mem->ptr + tex_offset,
-                                                 texture_bytes, &texels, &mapped_texels);
-    if (mapping_result != VK_SUCCESS) {
-        free(uniform_data[0]);
-        free(uniform_data[1]);
-        free(color);
-        return mapping_result;
-    }
-    struct mxgpu_native_render_state native_state;
-    bool native = mxgpu_native_render_available(-1);
-    if (!vk_draw_render_state(cmd, render_width, render_height, &native_state)) {
-        free(mapped_texels); free(uniform_data[0]); free(uniform_data[1]); free(color);
-        return VK_ERROR_DEVICE_LOST;
-    }
-    if (native_state.scissor.left >= native_state.scissor.right || native_state.scissor.top >= native_state.scissor.bottom) {
-        free(mapped_texels); free(uniform_data[0]); free(uniform_data[1]); free(color);
-        return VK_SUCCESS;
-    }
-    native_state.depth_enabled = cmd->fb->depth && cmd->pipe->depth_enabled;
-    if (!dv) native_state.blend.targets[0].write_mask = 0;
-    else native_state.blend.targets[0].write_mask &= vk_color_write_mask(dv->format);
-    if (!native && (native_state.depth_enabled || native_state.blend.targets[0].enable || native_state.blend.targets[0].write_mask != 15 ||
-        native_state.rasterizer.cull_mode != MXGPU_CULL_NONE || !native_state.rasterizer.depth_clip_enable ||
-        native_state.viewport.x || native_state.viewport.y != vk_float_bits((float)render_height) ||
-        native_state.viewport.width != vk_float_bits((float)render_width) ||
-        native_state.viewport.height != vk_float_bits(-(float)render_height) ||
-        native_state.viewport.min_depth || native_state.viewport.max_depth != vk_float_bits(1.f) ||
-        native_state.scissor.left || native_state.scissor.top ||
-        native_state.scissor.right != render_width || native_state.scissor.bottom != render_height)) {
-        free(mapped_texels); free(uniform_data[0]); free(uniform_data[1]); free(color);
-        return VK_ERROR_FEATURE_NOT_PRESENT;
-    }
     struct mxgpu_texture_input texture_inputs[MXGPU_TEXTURE_INPUTS] = {0};
     uint8_t *texture_storage[MXGPU_TEXTURE_INPUTS] = {0};
     uint32_t texture_count = 0;
-    VkResult texture_result = native ? vk_collect_texture_inputs(cmd, texture_inputs, texture_storage, &texture_count) :
-        (cmd->pipe->fragment_shader && cmd->pipe->fragment_shader->texture_count > 1 ?
-         VK_ERROR_FEATURE_NOT_PRESENT : VK_SUCCESS);
-    if (texture_result != VK_SUCCESS || (texture_count && (!native || !mxgpu_native_sampler_available(-1)))) {
-        vk_free_texture_inputs(texture_storage);
-        free(mapped_texels); free(uniform_data[0]); free(uniform_data[1]); free(color);
-        return texture_result != VK_SUCCESS ? texture_result : VK_ERROR_FEATURE_NOT_PRESENT;
+    struct mxgpu_native_render_state base_state;
+    VkResult result = collect_uniforms(cmd, 0, &uniform_data[0], &uniform_size[0]);
+    if (result == VK_SUCCESS)
+        result = collect_uniforms(cmd, 1, &uniform_data[1], &uniform_size[1]);
+    if (result == VK_SUCCESS)
+        result = stage_view_texture(tv, (const uint8_t *)tex->mem->ptr + tex_offset, texture_bytes, &texels, &mapped_texels);
+    if (result != VK_SUCCESS)
+        goto done;
+    bool native = mxgpu_native_render_available(-1);
+    if (!vk_draw_render_state(cmd, render_width, render_height, &base_state)) {
+        result = VK_ERROR_DEVICE_LOST;
+        goto done;
     }
-    native_state.sampler_enabled = texture_count != 0;
-    uint8_t *draw_module = NULL;
-    const uint8_t *module = cmd->pipe->bytes;
-    uint32_t module_len = cmd->pipe->len;
-    if (cmd->pipe->vertex_shader) {
-        draw_module = malloc(MXGPU_LINK_MODULE_CAPACITY);
-        uint32_t sampler_compare[MXGPU_TEXTURE_INPUTS] = {0};
-        for (uint32_t i = 0; i < texture_count; i++)
-            sampler_compare[i] = texture_inputs[i].sampler.compare;
-        if (!draw_module || mxgpu_link_shaders_draw_samplers(cmd->pipe->vertex_shader, cmd->pipe->fragment_shader,
-                cmd->vertex_count, texture_count != 0, draw_module, MXGPU_LINK_MODULE_CAPACITY, &module_len,
-                sampler_compare) != 0) {
-            VkResult failure = draw_module ? VK_ERROR_DEVICE_LOST : VK_ERROR_OUT_OF_HOST_MEMORY;
-            vk_free_texture_inputs(texture_storage);
-            free(draw_module); free(mapped_texels); free(uniform_data[0]); free(uniform_data[1]); free(color);
-            return failure;
+    if (base_state.scissor.left >= base_state.scissor.right || base_state.scissor.top >= base_state.scissor.bottom)
+        goto done;
+    base_state.depth_enabled = depth;
+    result = native ? vk_collect_texture_inputs(cmd, texture_inputs, texture_storage, &texture_count) :
+        (fs && fs->texture_count > 1 ? VK_ERROR_FEATURE_NOT_PRESENT : VK_SUCCESS);
+    if (result == VK_SUCCESS && texture_count && (!native || !mxgpu_native_sampler_available(-1)))
+        result = VK_ERROR_FEATURE_NOT_PRESENT;
+    if (result != VK_SUCCESS)
+        goto done;
+    base_state.sampler_enabled = texture_count != 0;
+    size_t depth_bytes = 0;
+    if (depth) {
+        uint32_t depth_format = vk_depth_format(cmd->depth_view->format);
+        result = !native || !mxgpu_native_depth_available(-1, depth_format) ? VK_ERROR_FEATURE_NOT_PRESENT :
+            vk_stage_attachment(cmd->depth_view, render_width, render_height, &depth_pixels);
+        if (result != VK_SUCCESS)
+            goto done;
+        depth_bytes = (size_t)render_width * render_height * vk_format_bytes(cmd->depth_view->format);
+        depth_original = malloc(depth_bytes);
+        if (!depth_original) {
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto done;
         }
-        module = draw_module;
+        memcpy(depth_original, depth_pixels, depth_bytes);
+        base_state.depth = (struct mxgpu_depth_input){depth_pixels, depth_format, render_width, render_height};
+        if (cmd->depth_view->format == VK_FORMAT_D32_SFLOAT)
+            base_state.depth_stencil.stencil_enable = 0;
     }
-    uint8_t *depth_pixels = NULL;
-    if (native_state.depth_enabled) {
-        struct mx_view *depth_view = cmd->fb->depth;
-        uint32_t depth_format = vk_depth_format(depth_view->format);
-        VkResult depth_result = !native || !mxgpu_native_depth_available(-1, depth_format) ?
-            VK_ERROR_FEATURE_NOT_PRESENT : vk_stage_attachment(depth_view, render_width, render_height, &depth_pixels);
-        if (depth_result != VK_SUCCESS) {
-            free(draw_module); vk_free_texture_inputs(texture_storage);
-            free(mapped_texels); free(uniform_data[0]); free(uniform_data[1]); free(color);
-            return depth_result;
+    bool depth_writes = depth && mxgpu_depth_stencil_writes(&base_state.depth_stencil);
+    uint32_t run_count = pass_count ? pass_count : 1;
+    bool first_run = true;
+    for (uint32_t run = occlusion ? 0 : 1; run <= run_count; run++) {
+        bool coverage = run == 0;
+        bool colour = !coverage && pass_count;
+        uint32_t attachment = colour ? passes[run - 1] : 0;
+        struct mxgpu_native_render_state state = base_state;
+        if (coverage) {
+            state.blend.targets[0] = (struct mxgpu_blend_target){0, 15, MXGPU_BLEND_ONE, MXGPU_BLEND_ZERO,
+                MXGPU_BLEND_ADD, MXGPU_BLEND_ONE, MXGPU_BLEND_ZERO, MXGPU_BLEND_ADD};
+        } else if (colour) {
+            state.blend.targets[0] = cmd->pipe->blend_targets[attachment];
+            state.blend.targets[0].write_mask &= vk_color_write_mask(cmd->colors[attachment]->format);
+        } else {
+            state.blend.targets[0].write_mask = 0;
         }
-        native_state.depth = (struct mxgpu_depth_input){depth_pixels, depth_format, render_width, render_height};
-        if (depth_view->format == VK_FORMAT_D32_SFLOAT)
-            native_state.depth_stencil.stencil_enable = 0;
+        if (!native && vk_native_state_required(&state, render_width, render_height)) {
+            result = VK_ERROR_FEATURE_NOT_PRESENT;
+            goto done;
+        }
+        const uint8_t *draw_module = cmd->pipe->bytes;
+        uint32_t module_len = cmd->pipe->len;
+        free(module);
+        module = NULL;
+        if (cmd->pipe->vertex_shader) {
+            result = vk_link_draw(cmd, texture_inputs, texture_count, &state.viewport,
+                                  coverage ? MXGPU_LINK_COVERAGE_OUTPUT : attachment, &module, &module_len);
+            if (result != VK_SUCCESS)
+                goto done;
+            draw_module = module;
+        }
+        free(color);
+        color = NULL;
+        if (colour) {
+            result = vk_stage_attachment(cmd->colors[attachment], render_width, render_height, &color);
+            if (result != VK_SUCCESS)
+                goto done;
+        } else {
+            color = calloc(1, (size_t)render_width * render_height * 4u);
+            if (!color) {
+                result = VK_ERROR_OUT_OF_HOST_MEMORY;
+                goto done;
+            }
+        }
+        if (depth_writes && !first_run)
+            memcpy(depth_pixels, depth_original, depth_bytes);
+        first_run = false;
+        if (mxgpu_execute_module_transaction_native_resources(-1, draw_module, module_len, verts, (int)cmd->vertex_count,
+                texels, (int)tv->width, (int)tv->height, color, color, (int)render_width, (int)render_height,
+                uniform_data[0], uniform_size[0], uniform_data[1], uniform_size[1], NULL, native ? &state : NULL,
+                stride_bytes, texture_inputs, texture_count) != 0) {
+            result = VK_ERROR_DEVICE_LOST;
+            goto done;
+        }
+        if (coverage) {
+            uint64_t samples = 0;
+            for (size_t pixel = 0; pixel < (size_t)render_width * render_height; pixel++)
+                samples += color[pixel * 4u] != 0;
+            if (cmd->occlusion_query < cmd->occlusion_pool->count)
+                cmd->occlusion_pool->values[cmd->occlusion_query] += samples;
+        } else if (colour) {
+            vk_commit_attachment(cmd->colors[attachment], render_width, render_height, color);
+        }
     }
-    int execute_result = mxgpu_execute_module_transaction_native_resources(-1, module, module_len, verts,
-                             (int)cmd->vertex_count,
-                             texels,
-                             (int)tv->width, (int)tv->height,
-                             color, color,
-                             (int)render_width, (int)render_height,
-                             uniform_data[0], uniform_size[0], uniform_data[1], uniform_size[1], NULL, native ? &native_state : NULL, stride_bytes, texture_inputs, texture_count);
-    free(draw_module);
+    if (depth_pixels)
+        vk_commit_attachment(cmd->depth_view, render_width, render_height, depth_pixels);
+done:
+    free(module);
+    free(color);
+    free(depth_pixels);
+    free(depth_original);
     vk_free_texture_inputs(texture_storage);
     free(mapped_texels);
     free(uniform_data[0]);
     free(uniform_data[1]);
-    if (execute_result != 0) {
-        free(depth_pixels);
-        free(color);
-        return VK_ERROR_DEVICE_LOST;
+    return result;
+}
+
+static void vk_level_extent(const struct mx_img *image, uint32_t level, uint32_t extent[3])
+{
+    extent[0] = level < 32 && (image->width >> level) ? image->width >> level : 1;
+    extent[1] = level < 32 && (image->height >> level) ? image->height >> level : 1;
+    extent[2] = level < 32 && (image->depth >> level) ? image->depth >> level : 1;
+}
+
+static VkDeviceSize vk_subresource_offset(const struct mx_img *image, uint32_t level, uint32_t layer, uint32_t extent[3])
+{
+    VkDeviceSize bytes = (VkDeviceSize)vk_format_bytes(image->format) * image->samples, offset = 0;
+    for (uint32_t l = 0; l < level; l++) {
+        vk_level_extent(image, l, extent);
+        offset += (VkDeviceSize)extent[0] * extent[1] * extent[2] * bytes * image->layers;
     }
-    if (dv) vk_commit_attachment(dv, render_width, render_height, color);
-    if (depth_pixels) vk_commit_attachment(cmd->fb->depth, render_width, render_height, depth_pixels);
-    free(depth_pixels);
-    free(color);
+    vk_level_extent(image, level, extent);
+    return offset + (VkDeviceSize)extent[0] * extent[1] * extent[2] * bytes * layer;
+}
+
+static bool vk_subresource(const struct mx_img *image, uint32_t level, uint32_t layer, uint8_t **base, uint32_t extent[3])
+{
+    if (!image || !image->mem || !image->mem->ptr || !vk_format_bytes(image->format) || !image->samples ||
+        level >= image->levels || layer >= image->layers ||
+        image->offset > image->mem->size || image->size > image->mem->size - image->offset)
+        return false;
+    VkDeviceSize offset = vk_subresource_offset(image, level, layer, extent);
+    VkDeviceSize bytes = (VkDeviceSize)extent[0] * extent[1] * extent[2] * vk_format_bytes(image->format) * image->samples;
+    if (offset > image->size || bytes > image->size - offset)
+        return false;
+    *base = (uint8_t *)image->mem->ptr + image->offset + offset;
+    return true;
+}
+
+static bool vk_clear_texel(VkFormat format, VkImageAspectFlags aspects, const VkClearValue *value, uint8_t *pixel)
+{
+    if (aspects & VK_IMAGE_ASPECT_COLOR_BIT) {
+        enum pipe_format color = vk_color_format(format);
+        if (color == PIPE_FORMAT_NONE)
+            return false;
+        util_format_pack_rgba(color, pixel, value->color.float32, 1);
+        return true;
+    }
+    if (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
+        float depth = value->depthStencil.depth;
+        if (!(depth >= 0.0f && depth <= 1.0f))
+            return false;
+        if (format == VK_FORMAT_D24_UNORM_S8_UINT)
+            mx_w32(pixel, 0, (mx_r32(pixel, 0) & 0xff000000u) | (uint32_t)((double)depth * 16777215.0 + 0.5));
+        else
+            mx_w32(pixel, 0, vk_float_bits(depth));
+    }
+    if (aspects & VK_IMAGE_ASPECT_STENCIL_BIT)
+        pixel[format == VK_FORMAT_D24_UNORM_S8_UINT ? 3 : 4] = (uint8_t)value->depthStencil.stencil;
+    if (format == VK_FORMAT_D32_SFLOAT_S8_UINT)
+        memset(pixel + 5, 0, 3);
+    return true;
+}
+
+static bool vk_clear_rows(uint8_t *base, uint32_t row_texels, uint32_t rows, unsigned texel_bytes, VkFormat format,
+                          VkImageAspectFlags aspects, const VkClearValue *value,
+                          uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
+{
+    uint8_t pattern[16] = {0};
+    bool color = aspects & VK_IMAGE_ASPECT_COLOR_BIT;
+    if (texel_bytes > sizeof pattern || (color && !vk_clear_texel(format, aspects, value, pattern)))
+        return false;
+    for (uint32_t y = y0; y < y1 && y < rows; y++)
+        for (uint32_t x = x0; x < x1 && x < row_texels; x++) {
+            uint8_t *pixel = base + ((size_t)y * row_texels + x) * texel_bytes;
+            if (color)
+                memcpy(pixel, pattern, texel_bytes);
+            else if (!vk_clear_texel(format, aspects, value, pixel))
+                return false;
+        }
+    return true;
+}
+
+static VkResult perform_clear_view(const struct mx_draw *op)
+{
+    struct mx_view *view = op->clear_view;
+    uint8_t *base;
+    if (!view) {
+        uint32_t slot = op->clear_slot;
+        view = slot < MXGPU_VK_COLOR_ATTACHMENTS ? (slot < op->state.color_count ? op->state.colors[slot] : NULL) :
+                                                    op->state.depth_view;
+        if (!view)
+            return VK_SUCCESS;
+    }
+    VkImageAspectFlags aspects = op->clear_aspects & mx_vk_format_aspects(view->format);
+    if (!aspects)
+        return VK_SUCCESS;
+    if (vk_view_backing(view, &base) != VK_SUCCESS)
+        return VK_ERROR_DEVICE_LOST;
+    int64_t right_limit = view->width, bottom_limit = view->height;
+    if (op->state.fb) {
+        right_limit = right_limit < op->state.fb->width ? right_limit : op->state.fb->width;
+        bottom_limit = bottom_limit < op->state.fb->height ? bottom_limit : op->state.fb->height;
+    }
+    int64_t left = op->clear_rect.offset.x, top = op->clear_rect.offset.y;
+    int64_t right = left + op->clear_rect.extent.width, bottom = top + op->clear_rect.extent.height;
+    left = left < 0 ? 0 : left;
+    top = top < 0 ? 0 : top;
+    right = right > right_limit ? right_limit : right;
+    bottom = bottom > bottom_limit ? bottom_limit : bottom;
+    if (left >= right || top >= bottom)
+        return VK_SUCCESS;
+    return vk_clear_rows(base, view->width, view->height, vk_format_bytes(view->format), view->format, aspects,
+                         &op->clear_value, (uint32_t)left, (uint32_t)top, (uint32_t)right, (uint32_t)bottom) ?
+           VK_SUCCESS : VK_ERROR_DEVICE_LOST;
+}
+
+static bool vk_range_counts(const struct mx_img *image, const VkImageSubresourceRange *range,
+                            uint32_t *levels, uint32_t *layers)
+{
+    if (!image || range->baseMipLevel >= image->levels || range->baseArrayLayer >= image->layers ||
+        !range->levelCount || !range->layerCount)
+        return false;
+    *levels = range->levelCount == VK_REMAINING_MIP_LEVELS ? image->levels - range->baseMipLevel : range->levelCount;
+    *layers = range->layerCount == VK_REMAINING_ARRAY_LAYERS ? image->layers - range->baseArrayLayer : range->layerCount;
+    return *levels <= image->levels - range->baseMipLevel && *layers <= image->layers - range->baseArrayLayer;
+}
+
+static VkResult perform_clear_image(const struct mx_draw *op)
+{
+    struct mx_img *image = op->dst_image;
+    const VkImageSubresourceRange *range = &op->clear_range;
+    uint32_t levels, layers, extent[3];
+    uint8_t *base;
+    if (!image || !range->aspectMask || (range->aspectMask & ~mx_vk_format_aspects(image->format)) ||
+        !vk_range_counts(image, range, &levels, &layers))
+        return VK_ERROR_DEVICE_LOST;
+    for (uint32_t level = range->baseMipLevel; level < range->baseMipLevel + levels; level++)
+        for (uint32_t layer = range->baseArrayLayer; layer < range->baseArrayLayer + layers; layer++) {
+            if (!vk_subresource(image, level, layer, &base, extent))
+                return VK_ERROR_DEVICE_LOST;
+            uint32_t rows = extent[1] * extent[2];
+            if (!vk_clear_rows(base, extent[0] * image->samples, rows, vk_format_bytes(image->format), image->format,
+                               range->aspectMask, &op->clear_value, 0, 0, extent[0] * image->samples, rows))
+                return VK_ERROR_DEVICE_LOST;
+        }
+    return VK_SUCCESS;
+}
+
+static bool vk_buffer_span(const struct mx_buf *buffer, VkDeviceSize offset, VkDeviceSize size, uint8_t **data)
+{
+    if (!buffer || !buffer->mem || !buffer->mem->ptr || buffer->offset > buffer->mem->size ||
+        buffer->size > buffer->mem->size - buffer->offset || offset > buffer->size || size > buffer->size - offset)
+        return false;
+    *data = (uint8_t *)buffer->mem->ptr + buffer->offset + offset;
+    return true;
+}
+
+static VkResult perform_fill_buffer(const struct mx_draw *op)
+{
+    uint8_t *target;
+    VkDeviceSize size = op->copy_region.size;
+    if (!op->copy_dst || op->copy_region.dstOffset > op->copy_dst->size)
+        return VK_ERROR_DEVICE_LOST;
+    if (size == VK_WHOLE_SIZE)
+        size = (op->copy_dst->size - op->copy_region.dstOffset) & ~(VkDeviceSize)3;
+    if (op->copy_region.dstOffset % 4 || size % 4 || !vk_buffer_span(op->copy_dst, op->copy_region.dstOffset, size, &target))
+        return VK_ERROR_DEVICE_LOST;
+    for (VkDeviceSize i = 0; i < size; i += 4)
+        memcpy(target + i, &op->fill_value, 4);
+    return VK_SUCCESS;
+}
+
+static VkResult perform_update_buffer(const struct mx_draw *op)
+{
+    uint8_t *target;
+    if (!op->update_data || !vk_buffer_span(op->copy_dst, op->copy_region.dstOffset, op->copy_region.size, &target))
+        return VK_ERROR_DEVICE_LOST;
+    memcpy(target, op->update_data, (size_t)op->copy_region.size);
+    return VK_SUCCESS;
+}
+
+static bool vk_aspect_bytes(VkFormat format, VkImageAspectFlags aspect, unsigned *offset, unsigned *bytes)
+{
+    *offset = 0;
+    *bytes = vk_format_bytes(format);
+    if (aspect == VK_IMAGE_ASPECT_COLOR_BIT)
+        return vk_color_format(format) != PIPE_FORMAT_NONE;
+    if (!(mx_vk_format_aspects(format) & aspect) || (aspect & (aspect - 1)))
+        return false;
+    if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT) {
+        *bytes = format == VK_FORMAT_D24_UNORM_S8_UINT ? 3 : 4;
+        return true;
+    }
+    *offset = format == VK_FORMAT_D24_UNORM_S8_UINT ? 3 : 4;
+    *bytes = 1;
+    return true;
+}
+
+static bool vk_region_inside(const uint32_t extent[3], VkOffset3D offset, VkExtent3D size)
+{
+    return offset.x >= 0 && offset.y >= 0 && offset.z >= 0 &&
+           (uint32_t)offset.x <= extent[0] && size.width <= extent[0] - (uint32_t)offset.x &&
+           (uint32_t)offset.y <= extent[1] && size.height <= extent[1] - (uint32_t)offset.y &&
+           (uint32_t)offset.z <= extent[2] && size.depth <= extent[2] - (uint32_t)offset.z;
+}
+
+static VkResult perform_copy_image(const struct mx_draw *op)
+{
+    const VkImageCopy *region = &op->image_copy;
+    struct mx_img *source = op->src_image, *destination = op->dst_image;
+    unsigned src_offset, src_bytes, dst_offset, dst_bytes;
+    if (!source || !destination || source->samples != destination->samples ||
+        region->srcSubresource.layerCount != region->dstSubresource.layerCount || !region->srcSubresource.layerCount ||
+        !vk_aspect_bytes(source->format, region->srcSubresource.aspectMask, &src_offset, &src_bytes) ||
+        !vk_aspect_bytes(destination->format, region->dstSubresource.aspectMask, &dst_offset, &dst_bytes) ||
+        src_bytes != dst_bytes)
+        return VK_ERROR_DEVICE_LOST;
+    unsigned src_texel = vk_format_bytes(source->format) * source->samples;
+    unsigned dst_texel = vk_format_bytes(destination->format) * destination->samples;
+    for (uint32_t layer = 0; layer < region->srcSubresource.layerCount; layer++) {
+        uint8_t *src_base, *dst_base;
+        uint32_t src_extent[3], dst_extent[3];
+        if (!vk_subresource(source, region->srcSubresource.mipLevel, region->srcSubresource.baseArrayLayer + layer,
+                            &src_base, src_extent) ||
+            !vk_subresource(destination, region->dstSubresource.mipLevel, region->dstSubresource.baseArrayLayer + layer,
+                            &dst_base, dst_extent) ||
+            !vk_region_inside(src_extent, region->srcOffset, region->extent) ||
+            !vk_region_inside(dst_extent, region->dstOffset, region->extent))
+            return VK_ERROR_DEVICE_LOST;
+        for (uint32_t z = 0; z < region->extent.depth; z++)
+            for (uint32_t y = 0; y < region->extent.height; y++) {
+                uint8_t *src_row = src_base + (((size_t)(region->srcOffset.z + z) * src_extent[1] + region->srcOffset.y + y) *
+                                               src_extent[0] + region->srcOffset.x) * src_texel;
+                uint8_t *dst_row = dst_base + (((size_t)(region->dstOffset.z + z) * dst_extent[1] + region->dstOffset.y + y) *
+                                               dst_extent[0] + region->dstOffset.x) * dst_texel;
+                if (src_bytes == src_texel / source->samples && src_texel == dst_texel && !src_offset && !dst_offset &&
+                    destination->format != VK_FORMAT_D24_UNORM_S8_UINT) {
+                    memmove(dst_row, src_row, (size_t)region->extent.width * src_texel);
+                    continue;
+                }
+                for (uint32_t x = 0; x < region->extent.width * source->samples; x++) {
+                    uint8_t *src_pixel = src_row + (size_t)x * (src_texel / source->samples);
+                    uint8_t *dst_pixel = dst_row + (size_t)x * (dst_texel / destination->samples);
+                    if (region->dstSubresource.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT &&
+                        destination->format == VK_FORMAT_D24_UNORM_S8_UINT)
+                        mx_w32(dst_pixel, 0, (mx_r32(dst_pixel, 0) & 0xff000000u) | (mx_r32(src_pixel, 0) & 0xffffffu));
+                    else
+                        memmove(dst_pixel + dst_offset, src_pixel + src_offset, src_bytes);
+                }
+            }
+    }
+    return VK_SUCCESS;
+}
+
+static void vk_fetch_rgba(const struct mx_img *image, const uint8_t *base, const uint32_t extent[3],
+                          int64_t x, int64_t y, int64_t z, float rgba[4])
+{
+    x = x < 0 ? 0 : x >= extent[0] ? extent[0] - 1 : x;
+    y = y < 0 ? 0 : y >= extent[1] ? extent[1] - 1 : y;
+    z = z < 0 ? 0 : z >= extent[2] ? extent[2] - 1 : z;
+    unsigned texel = vk_format_bytes(image->format) * image->samples;
+    util_format_unpack_rgba(vk_color_format(image->format), rgba,
+                            base + (((size_t)z * extent[1] + (size_t)y) * extent[0] + (size_t)x) * texel, 1);
+}
+
+static VkResult perform_blit_image(const struct mx_draw *op)
+{
+    const VkImageBlit *region = &op->image_blit;
+    struct mx_img *source = op->src_image, *destination = op->dst_image;
+    bool color = region->srcSubresource.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT;
+    if (!source || !destination || source->samples != 1 || destination->samples != 1 ||
+        region->srcSubresource.layerCount != region->dstSubresource.layerCount || !region->srcSubresource.layerCount ||
+        region->srcSubresource.aspectMask != region->dstSubresource.aspectMask ||
+        (color ? vk_color_format(source->format) == PIPE_FORMAT_NONE ||
+                 vk_color_format(destination->format) == PIPE_FORMAT_NONE :
+                 source->format != destination->format || op->filter != VK_FILTER_NEAREST ||
+                 (region->srcSubresource.aspectMask & ~mx_vk_format_aspects(source->format))) ||
+        (op->filter != VK_FILTER_NEAREST && op->filter != VK_FILTER_LINEAR))
+        return VK_ERROR_DEVICE_LOST;
+    const VkOffset3D *s = region->srcOffsets, *d = region->dstOffsets;
+    int32_t dx0 = d[0].x < d[1].x ? d[0].x : d[1].x, dx1 = d[0].x < d[1].x ? d[1].x : d[0].x;
+    int32_t dy0 = d[0].y < d[1].y ? d[0].y : d[1].y, dy1 = d[0].y < d[1].y ? d[1].y : d[0].y;
+    int32_t dz0 = d[0].z < d[1].z ? d[0].z : d[1].z, dz1 = d[0].z < d[1].z ? d[1].z : d[0].z;
+    if (d[0].x == d[1].x || d[0].y == d[1].y || d[0].z == d[1].z)
+        return VK_SUCCESS;
+    double sx = (double)(s[1].x - s[0].x) / (d[1].x - d[0].x), sy = (double)(s[1].y - s[0].y) / (d[1].y - d[0].y);
+    double sz = (double)(s[1].z - s[0].z) / (d[1].z - d[0].z);
+    unsigned dst_texel = vk_format_bytes(destination->format);
+    for (uint32_t layer = 0; layer < region->srcSubresource.layerCount; layer++) {
+        uint8_t *src_base, *dst_base;
+        uint32_t src_extent[3], dst_extent[3];
+        if (!vk_subresource(source, region->srcSubresource.mipLevel, region->srcSubresource.baseArrayLayer + layer,
+                            &src_base, src_extent) ||
+            !vk_subresource(destination, region->dstSubresource.mipLevel, region->dstSubresource.baseArrayLayer + layer,
+                            &dst_base, dst_extent) ||
+            dx0 < 0 || dy0 < 0 || dz0 < 0 || (uint32_t)dx1 > dst_extent[0] || (uint32_t)dy1 > dst_extent[1] ||
+            (uint32_t)dz1 > dst_extent[2])
+            return VK_ERROR_DEVICE_LOST;
+        for (int32_t z = dz0; z < dz1; z++)
+            for (int32_t y = dy0; y < dy1; y++)
+                for (int32_t x = dx0; x < dx1; x++) {
+                    double u = s[0].x + (x + 0.5 - d[0].x) * sx, v = s[0].y + (y + 0.5 - d[0].y) * sy;
+                    double w = s[0].z + (z + 0.5 - d[0].z) * sz;
+                    uint8_t *pixel = dst_base + (((size_t)z * dst_extent[1] + y) * dst_extent[0] + x) * dst_texel;
+                    if (!color) {
+                        int64_t ix = (int64_t)floor(u), iy = (int64_t)floor(v), iz = (int64_t)floor(w);
+                        ix = ix < 0 ? 0 : ix >= src_extent[0] ? src_extent[0] - 1 : ix;
+                        iy = iy < 0 ? 0 : iy >= src_extent[1] ? src_extent[1] - 1 : iy;
+                        iz = iz < 0 ? 0 : iz >= src_extent[2] ? src_extent[2] - 1 : iz;
+                        const uint8_t *texel = src_base + (((size_t)iz * src_extent[1] + iy) * src_extent[0] + ix) * dst_texel;
+                        unsigned offset, bytes;
+                        for (VkImageAspectFlags aspect = 1; aspect <= VK_IMAGE_ASPECT_STENCIL_BIT; aspect <<= 1)
+                            if ((region->dstSubresource.aspectMask & aspect) &&
+                                vk_aspect_bytes(destination->format, aspect, &offset, &bytes))
+                                memcpy(pixel + offset, texel + offset, bytes);
+                        continue;
+                    }
+                    float rgba[4];
+                    if (op->filter == VK_FILTER_NEAREST) {
+                        vk_fetch_rgba(source, src_base, src_extent, (int64_t)floor(u), (int64_t)floor(v),
+                                      (int64_t)floor(w), rgba);
+                    } else {
+                        double fu = u - 0.5, fv = v - 0.5;
+                        int64_t x0 = (int64_t)floor(fu), y0 = (int64_t)floor(fv), iz = (int64_t)floor(w);
+                        float a = (float)(fu - x0), b = (float)(fv - y0), t[4][4];
+                        vk_fetch_rgba(source, src_base, src_extent, x0, y0, iz, t[0]);
+                        vk_fetch_rgba(source, src_base, src_extent, x0 + 1, y0, iz, t[1]);
+                        vk_fetch_rgba(source, src_base, src_extent, x0, y0 + 1, iz, t[2]);
+                        vk_fetch_rgba(source, src_base, src_extent, x0 + 1, y0 + 1, iz, t[3]);
+                        for (unsigned c = 0; c < 4; c++)
+                            rgba[c] = (t[0][c] * (1 - a) + t[1][c] * a) * (1 - b) + (t[2][c] * (1 - a) + t[3][c] * a) * b;
+                    }
+                    util_format_pack_rgba(vk_color_format(destination->format), pixel, rgba, 1);
+                }
+    }
+    return VK_SUCCESS;
+}
+
+static VkResult perform_resolve_image(const struct mx_draw *op)
+{
+    const VkImageResolve *region = &op->image_resolve;
+    struct mx_img *source = op->src_image, *destination = op->dst_image;
+    enum pipe_format format = source ? vk_color_format(source->format) : PIPE_FORMAT_NONE;
+    if (!source || !destination || format == PIPE_FORMAT_NONE || source->format != destination->format ||
+        destination->samples != 1 || region->srcSubresource.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+        region->srcSubresource.layerCount != region->dstSubresource.layerCount)
+        return VK_ERROR_DEVICE_LOST;
+    unsigned bytes = vk_format_bytes(source->format);
+    for (uint32_t layer = 0; layer < region->srcSubresource.layerCount; layer++) {
+        uint8_t *src_base, *dst_base;
+        uint32_t src_extent[3], dst_extent[3];
+        if (!vk_subresource(source, region->srcSubresource.mipLevel, region->srcSubresource.baseArrayLayer + layer,
+                            &src_base, src_extent) ||
+            !vk_subresource(destination, region->dstSubresource.mipLevel, region->dstSubresource.baseArrayLayer + layer,
+                            &dst_base, dst_extent) ||
+            !vk_region_inside(src_extent, region->srcOffset, region->extent) ||
+            !vk_region_inside(dst_extent, region->dstOffset, region->extent))
+            return VK_ERROR_DEVICE_LOST;
+        for (uint32_t z = 0; z < region->extent.depth; z++)
+            for (uint32_t y = 0; y < region->extent.height; y++)
+                for (uint32_t x = 0; x < region->extent.width; x++) {
+                    const uint8_t *texel = src_base + ((((size_t)region->srcOffset.z + z) * src_extent[1] +
+                        region->srcOffset.y + y) * src_extent[0] + region->srcOffset.x + x) * bytes * source->samples;
+                    float sum[4] = {0}, rgba[4];
+                    for (uint32_t sample = 0; sample < source->samples; sample++) {
+                        util_format_unpack_rgba(format, rgba, texel + (size_t)sample * bytes, 1);
+                        for (unsigned c = 0; c < 4; c++)
+                            sum[c] += rgba[c] / source->samples;
+                    }
+                    util_format_pack_rgba(format, dst_base + ((((size_t)region->dstOffset.z + z) * dst_extent[1] +
+                        region->dstOffset.y + y) * dst_extent[0] + region->dstOffset.x + x) * bytes, sum, 1);
+                }
+    }
+    return VK_SUCCESS;
+}
+
+static VkResult perform_draw_indirect(const struct mx_draw *op)
+{
+    bool indexed = op->state.indexed;
+    VkDeviceSize record = indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
+    for (uint32_t i = 0; i < op->indirect_count; i++) {
+        uint8_t *source;
+        VkDeviceSize at = op->indirect_offset + (VkDeviceSize)i * op->indirect_stride;
+        if (!vk_buffer_span(op->indirect, at, record, &source))
+            return VK_ERROR_DEVICE_LOST;
+        struct mx_cmd state = op->state;
+        state.draw = 1;
+        if (indexed) {
+            VkDrawIndexedIndirectCommand draw;
+            memcpy(&draw, source, sizeof draw);
+            if (!draw.indexCount || !draw.instanceCount)
+                continue;
+            state.vertex_count = draw.indexCount;
+            state.instance_count = draw.instanceCount;
+            state.first_index = draw.firstIndex;
+            state.vertex_bias = draw.vertexOffset;
+            state.first_instance = draw.firstInstance;
+            state.first_vertex = 0;
+        } else {
+            VkDrawIndirectCommand draw;
+            memcpy(&draw, source, sizeof draw);
+            if (!draw.vertexCount || !draw.instanceCount)
+                continue;
+            state.vertex_count = draw.vertexCount;
+            state.instance_count = draw.instanceCount;
+            state.first_vertex = draw.firstVertex;
+            state.first_instance = draw.firstInstance;
+        }
+        VkResult result = perform_draw(&state);
+        if (result != VK_SUCCESS)
+            return result;
+    }
+    return VK_SUCCESS;
+}
+
+static uint64_t vk_timestamp_now(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
+}
+
+static bool vk_wait_flag(atomic_int *flag)
+{
+    uint64_t start = vk_timestamp_now();
+    while (!atomic_load_explicit(flag, memory_order_acquire)) {
+        if (vk_timestamp_now() - start > MXGPU_VK_EVENT_TIMEOUT_NS)
+            return false;
+        nanosleep(&(struct timespec){0, 100000}, NULL);
+    }
+    return true;
+}
+
+static VkResult perform_wait_events(const struct mx_draw *op)
+{
+    for (uint32_t i = 0; i < op->event_count; i++)
+        if (!op->events[i] || !vk_wait_flag(&op->events[i]->signaled))
+            return VK_ERROR_DEVICE_LOST;
+    atomic_thread_fence(memory_order_seq_cst);
+    return VK_SUCCESS;
+}
+
+static bool vk_query_write(struct mx_query_pool *pool, uint32_t query, VkQueryResultFlags flags, uint8_t *out)
+{
+    bool available = atomic_load_explicit(&pool->available[query], memory_order_acquire) != 0;
+    uint64_t value = pool->values[query];
+    bool wide = flags & VK_QUERY_RESULT_64_BIT;
+    if (available || (flags & VK_QUERY_RESULT_PARTIAL_BIT)) {
+        if (wide)
+            memcpy(out, &value, 8);
+        else {
+            uint32_t narrow = value > UINT32_MAX ? UINT32_MAX : (uint32_t)value;
+            memcpy(out, &narrow, 4);
+        }
+    }
+    if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) {
+        if (wide) {
+            uint64_t flag = available;
+            memcpy(out + 8, &flag, 8);
+        } else {
+            uint32_t flag = available;
+            memcpy(out + 4, &flag, 4);
+        }
+    }
+    return available;
+}
+
+static VkResult perform_query(const struct mx_draw *op)
+{
+    struct mx_query_pool *pool = op->query_pool;
+    if (!pool || op->first_query > pool->count || op->query_count > pool->count - op->first_query)
+        return VK_ERROR_DEVICE_LOST;
+    for (uint32_t i = 0; i < op->query_count; i++) {
+        uint32_t query = op->first_query + i;
+        switch (op->operation) {
+        case MX_OP_RESET_QUERIES:
+        case MX_OP_BEGIN_QUERY:
+            pool->values[query] = 0;
+            atomic_store_explicit(&pool->available[query], 0, memory_order_release);
+            break;
+        case MX_OP_END_QUERY:
+            atomic_store_explicit(&pool->available[query], 1, memory_order_release);
+            break;
+        case MX_OP_TIMESTAMP:
+            pool->values[query] = vk_timestamp_now();
+            atomic_store_explicit(&pool->available[query], 1, memory_order_release);
+            break;
+        case MX_OP_COPY_QUERIES: {
+            unsigned bytes = ((op->query_flags & VK_QUERY_RESULT_64_BIT) ? 8u : 4u) *
+                             ((op->query_flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) ? 2u : 1u);
+            uint8_t *target;
+            if (!vk_buffer_span(op->copy_dst, op->copy_region.dstOffset + (VkDeviceSize)i * op->query_stride, bytes, &target))
+                return VK_ERROR_DEVICE_LOST;
+            if ((op->query_flags & VK_QUERY_RESULT_WAIT_BIT) && !vk_wait_flag(&pool->available[query]))
+                return VK_ERROR_DEVICE_LOST;
+            vk_query_write(pool, query, op->query_flags, target);
+            break;
+        }
+        default:
+            return VK_ERROR_DEVICE_LOST;
+        }
+    }
+    return VK_SUCCESS;
+}
+
+static VkResult perform_buffer_copy(const struct mx_draw *operation);
+static VkResult perform_buffer_image_copy(const struct mx_draw *operation);
+static VkResult perform_dispatch(struct mx_draw *operation);
+static VkResult perform_pipeline_barrier(void);
+
+static VkResult perform_operation(struct mx_draw *op)
+{
+    switch (op->operation) {
+    case MX_OP_DRAW: return perform_draw(&op->state);
+    case MX_OP_COPY_BUFFER: return perform_buffer_copy(op);
+    case MX_OP_BUFFER_TO_IMAGE:
+    case MX_OP_IMAGE_TO_BUFFER: return perform_buffer_image_copy(op);
+    case MX_OP_BARRIER: return perform_pipeline_barrier();
+    case MX_OP_DISPATCH: return perform_dispatch(op);
+    case MX_OP_CLEAR_VIEW: return perform_clear_view(op);
+    case MX_OP_DRAW_INDIRECT: return perform_draw_indirect(op);
+    case MX_OP_FILL_BUFFER: return perform_fill_buffer(op);
+    case MX_OP_UPDATE_BUFFER: return perform_update_buffer(op);
+    case MX_OP_COPY_IMAGE: return perform_copy_image(op);
+    case MX_OP_BLIT_IMAGE: return perform_blit_image(op);
+    case MX_OP_RESOLVE_IMAGE: return perform_resolve_image(op);
+    case MX_OP_CLEAR_IMAGE: return perform_clear_image(op);
+    case MX_OP_SET_EVENT:
+        for (uint32_t i = 0; i < op->event_count; i++)
+            atomic_store_explicit(&op->events[i]->signaled, op->event_value, memory_order_release);
+        return VK_SUCCESS;
+    case MX_OP_WAIT_EVENTS: return perform_wait_events(op);
+    case MX_OP_RESET_QUERIES:
+    case MX_OP_BEGIN_QUERY:
+    case MX_OP_END_QUERY:
+    case MX_OP_TIMESTAMP:
+    case MX_OP_COPY_QUERIES: return perform_query(op);
+    default: return VK_ERROR_DEVICE_LOST;
+    }
+}
+
+static void record_indirect_draw(VkCommandBuffer command, VkBuffer buffer, VkDeviceSize offset, uint32_t count,
+                                 uint32_t stride, bool indexed)
+{
+    struct mx_cmd *cmd = (struct mx_cmd *)command;
+    VkDeviceSize record = indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
+    if (cmd->record_result != VK_SUCCESS || !count)
+        return;
+    if (!cmd->open || !buffer || offset % 4 || (count > 1 && (stride % 4 || stride < record))) {
+        cmd->record_result = VK_ERROR_DEVICE_LOST;
+        return;
+    }
+    cmd->draw = 1;
+    struct mx_draw *draw = record_snapshot(cmd, cmd->bound_sets, cmd->bound_offsets, cmd->bound_set_count);
+    if (!draw)
+        return;
+    draw->operation = MX_OP_DRAW_INDIRECT;
+    draw->state.indexed = indexed;
+    draw->indirect = (struct mx_buf *)buffer;
+    draw->indirect_offset = offset;
+    draw->indirect_count = count;
+    draw->indirect_stride = count > 1 ? stride : (uint32_t)record;
+}
+
+static void cmd_draw_indirect(VkCommandBuffer command, VkBuffer buffer, VkDeviceSize offset, uint32_t count,
+                              uint32_t stride)
+{
+    record_indirect_draw(command, buffer, offset, count, stride, false);
+}
+
+static void cmd_draw_indexed_indirect(VkCommandBuffer command, VkBuffer buffer, VkDeviceSize offset, uint32_t count,
+                                      uint32_t stride)
+{
+    record_indirect_draw(command, buffer, offset, count, stride, true);
+}
+
+static void cmd_fill_buffer(VkCommandBuffer command, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size,
+                            uint32_t data)
+{
+    struct mx_cmd *cmd = (struct mx_cmd *)command;
+    if (!buffer || offset % 4 || !size || (size != VK_WHOLE_SIZE && size % 4)) {
+        if (cmd->record_result == VK_SUCCESS)
+            cmd->record_result = VK_ERROR_DEVICE_LOST;
+        return;
+    }
+    struct mx_draw *op = append_operation(cmd, MX_OP_FILL_BUFFER);
+    if (!op)
+        return;
+    op->copy_dst = (struct mx_buf *)buffer;
+    op->copy_region = (VkBufferCopy){0, offset, size};
+    op->fill_value = data;
+}
+
+static void cmd_update_buffer(VkCommandBuffer command, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size,
+                              const void *data)
+{
+    struct mx_cmd *cmd = (struct mx_cmd *)command;
+    if (!buffer || !data || offset % 4 || !size || size % 4 || size > 65536) {
+        if (cmd->record_result == VK_SUCCESS)
+            cmd->record_result = VK_ERROR_DEVICE_LOST;
+        return;
+    }
+    struct mx_draw *op = append_operation(cmd, MX_OP_UPDATE_BUFFER);
+    if (!op)
+        return;
+    op->update_data = malloc((size_t)size);
+    if (!op->update_data) {
+        cmd->record_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+        return;
+    }
+    memcpy(op->update_data, data, (size_t)size);
+    op->copy_dst = (struct mx_buf *)buffer;
+    op->copy_region = (VkBufferCopy){0, offset, size};
+}
+
+static void cmd_copy_image(VkCommandBuffer command, VkImage source, VkImageLayout source_layout, VkImage destination,
+                           VkImageLayout destination_layout, uint32_t count, const VkImageCopy *regions)
+{
+    (void)source_layout;
+    (void)destination_layout;
+    for (uint32_t i = 0; i < count; i++) {
+        struct mx_draw *op = append_operation((struct mx_cmd *)command, MX_OP_COPY_IMAGE);
+        if (!op)
+            return;
+        op->src_image = (struct mx_img *)source;
+        op->dst_image = (struct mx_img *)destination;
+        op->image_copy = regions[i];
+    }
+}
+
+static void cmd_blit_image(VkCommandBuffer command, VkImage source, VkImageLayout source_layout, VkImage destination,
+                           VkImageLayout destination_layout, uint32_t count, const VkImageBlit *regions, VkFilter filter)
+{
+    (void)source_layout;
+    (void)destination_layout;
+    for (uint32_t i = 0; i < count; i++) {
+        struct mx_draw *op = append_operation((struct mx_cmd *)command, MX_OP_BLIT_IMAGE);
+        if (!op)
+            return;
+        op->src_image = (struct mx_img *)source;
+        op->dst_image = (struct mx_img *)destination;
+        op->image_blit = regions[i];
+        op->filter = filter;
+    }
+}
+
+static void cmd_resolve_image(VkCommandBuffer command, VkImage source, VkImageLayout source_layout, VkImage destination,
+                              VkImageLayout destination_layout, uint32_t count, const VkImageResolve *regions)
+{
+    (void)source_layout;
+    (void)destination_layout;
+    for (uint32_t i = 0; i < count; i++) {
+        struct mx_draw *op = append_operation((struct mx_cmd *)command, MX_OP_RESOLVE_IMAGE);
+        if (!op)
+            return;
+        op->src_image = (struct mx_img *)source;
+        op->dst_image = (struct mx_img *)destination;
+        op->image_resolve = regions[i];
+    }
+}
+
+static void record_clear_image(VkCommandBuffer command, VkImage image, const VkClearValue *value, uint32_t count,
+                               const VkImageSubresourceRange *ranges)
+{
+    for (uint32_t i = 0; i < count; i++) {
+        struct mx_draw *op = append_operation((struct mx_cmd *)command, MX_OP_CLEAR_IMAGE);
+        if (!op)
+            return;
+        op->dst_image = (struct mx_img *)image;
+        op->clear_value = *value;
+        op->clear_range = ranges[i];
+    }
+}
+
+static void cmd_clear_color_image(VkCommandBuffer command, VkImage image, VkImageLayout layout,
+                                  const VkClearColorValue *color, uint32_t count, const VkImageSubresourceRange *ranges)
+{
+    VkClearValue value = {.color = *color};
+    (void)layout;
+    record_clear_image(command, image, &value, count, ranges);
+}
+
+static void cmd_clear_depth_stencil_image(VkCommandBuffer command, VkImage image, VkImageLayout layout,
+                                          const VkClearDepthStencilValue *depth, uint32_t count,
+                                          const VkImageSubresourceRange *ranges)
+{
+    VkClearValue value = {.depthStencil = *depth};
+    (void)layout;
+    record_clear_image(command, image, &value, count, ranges);
+}
+
+static VkResult create_event(VkDevice device, const VkEventCreateInfo *info, const VkAllocationCallbacks *alloc,
+                             VkEvent *out)
+{
+    (void)device;
+    (void)info;
+    (void)alloc;
+    struct mx_event *event = calloc(1, sizeof *event);
+    *out = (VkEvent)event;
+    return event ? VK_SUCCESS : VK_ERROR_OUT_OF_HOST_MEMORY;
+}
+
+static void destroy_event(VkDevice device, VkEvent event, const VkAllocationCallbacks *alloc)
+{
+    (void)device;
+    (void)alloc;
+    free(event);
+}
+
+static VkResult event_status(VkDevice device, VkEvent event)
+{
+    struct mx_device *owner = (struct mx_device *)device;
+    if (owner && atomic_load_explicit(&owner->lost, memory_order_acquire))
+        return VK_ERROR_DEVICE_LOST;
+    return atomic_load_explicit(&((struct mx_event *)event)->signaled, memory_order_acquire) ?
+           VK_EVENT_SET : VK_EVENT_RESET;
+}
+
+static VkResult set_event(VkDevice device, VkEvent event)
+{
+    (void)device;
+    atomic_store_explicit(&((struct mx_event *)event)->signaled, 1, memory_order_release);
+    return VK_SUCCESS;
+}
+
+static VkResult reset_event(VkDevice device, VkEvent event)
+{
+    (void)device;
+    atomic_store_explicit(&((struct mx_event *)event)->signaled, 0, memory_order_release);
+    return VK_SUCCESS;
+}
+
+static struct mx_draw *record_events(struct mx_cmd *cmd, int kind, uint32_t count, const VkEvent *events)
+{
+    if (count && !events) {
+        if (cmd->record_result == VK_SUCCESS)
+            cmd->record_result = VK_ERROR_DEVICE_LOST;
+        return NULL;
+    }
+    struct mx_draw *op = append_operation(cmd, kind);
+    if (!op)
+        return NULL;
+    op->events = count ? malloc((size_t)count * sizeof *op->events) : NULL;
+    if (count && !op->events) {
+        cmd->record_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+        return NULL;
+    }
+    for (uint32_t i = 0; i < count; i++)
+        op->events[i] = (struct mx_event *)events[i];
+    op->event_count = count;
+    return op;
+}
+
+static void cmd_set_event(VkCommandBuffer command, VkEvent event, VkPipelineStageFlags stages)
+{
+    (void)stages;
+    struct mx_draw *op = record_events((struct mx_cmd *)command, MX_OP_SET_EVENT, 1, &event);
+    if (op)
+        op->event_value = 1;
+}
+
+static void cmd_reset_event(VkCommandBuffer command, VkEvent event, VkPipelineStageFlags stages)
+{
+    (void)stages;
+    struct mx_draw *op = record_events((struct mx_cmd *)command, MX_OP_SET_EVENT, 1, &event);
+    if (op)
+        op->event_value = 0;
+}
+
+static void cmd_wait_events(VkCommandBuffer command, uint32_t count, const VkEvent *events,
+                            VkPipelineStageFlags source_stages, VkPipelineStageFlags destination_stages,
+                            uint32_t memory_count, const VkMemoryBarrier *memory,
+                            uint32_t buffer_count, const VkBufferMemoryBarrier *buffers,
+                            uint32_t image_count, const VkImageMemoryBarrier *images)
+{
+    (void)source_stages;
+    (void)destination_stages;
+    if ((memory_count && !memory) || (buffer_count && !buffers) || (image_count && !images)) {
+        struct mx_cmd *cmd = (struct mx_cmd *)command;
+        if (cmd->record_result == VK_SUCCESS)
+            cmd->record_result = VK_ERROR_DEVICE_LOST;
+        return;
+    }
+    record_events((struct mx_cmd *)command, MX_OP_WAIT_EVENTS, count, events);
+}
+
+static VkResult create_query_pool(VkDevice device, const VkQueryPoolCreateInfo *info,
+                                  const VkAllocationCallbacks *alloc, VkQueryPool *out)
+{
+    (void)device;
+    (void)alloc;
+    *out = VK_NULL_HANDLE;
+    if (!info->queryCount || (info->queryType != VK_QUERY_TYPE_OCCLUSION && info->queryType != VK_QUERY_TYPE_TIMESTAMP))
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    struct mx_query_pool *pool = calloc(1, sizeof *pool);
+    if (!pool)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    pool->type = info->queryType;
+    pool->count = info->queryCount;
+    pool->values = calloc(info->queryCount, sizeof *pool->values);
+    pool->available = calloc(info->queryCount, sizeof *pool->available);
+    if (!pool->values || !pool->available) {
+        free(pool->values);
+        free(pool->available);
+        free(pool);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    *out = (VkQueryPool)pool;
+    return VK_SUCCESS;
+}
+
+static void destroy_query_pool(VkDevice device, VkQueryPool handle, const VkAllocationCallbacks *alloc)
+{
+    struct mx_query_pool *pool = (struct mx_query_pool *)handle;
+    (void)device;
+    (void)alloc;
+    if (!pool)
+        return;
+    free(pool->values);
+    free((void *)pool->available);
+    free(pool);
+}
+
+static VkResult query_pool_results(VkDevice device, VkQueryPool handle, uint32_t first, uint32_t count,
+                                   size_t size, void *data, VkDeviceSize stride, VkQueryResultFlags flags)
+{
+    struct mx_query_pool *pool = (struct mx_query_pool *)handle;
+    struct mx_device *owner = (struct mx_device *)device;
+    unsigned bytes = ((flags & VK_QUERY_RESULT_64_BIT) ? 8u : 4u) *
+                     ((flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) ? 2u : 1u);
+    VkResult result = VK_SUCCESS;
+    if (owner && atomic_load_explicit(&owner->lost, memory_order_acquire))
+        return VK_ERROR_DEVICE_LOST;
+    if (!pool || first > pool->count || count > pool->count - first || !data)
+        return VK_ERROR_DEVICE_LOST;
+    for (uint32_t i = 0; i < count; i++) {
+        VkDeviceSize at = (VkDeviceSize)i * stride;
+        if (at > size || bytes > size - at)
+            return VK_ERROR_DEVICE_LOST;
+        if ((flags & VK_QUERY_RESULT_WAIT_BIT) && !vk_wait_flag(&pool->available[first + i]))
+            return VK_ERROR_DEVICE_LOST;
+        if (!vk_query_write(pool, first + i, flags, (uint8_t *)data + at))
+            result = VK_NOT_READY;
+    }
+    return result;
+}
+
+static struct mx_draw *record_query(VkCommandBuffer command, int kind, VkQueryPool pool, uint32_t first, uint32_t count)
+{
+    struct mx_cmd *cmd = (struct mx_cmd *)command;
+    struct mx_query_pool *owner = (struct mx_query_pool *)pool;
+    if (!owner || first > owner->count || count > owner->count - first) {
+        if (cmd->record_result == VK_SUCCESS)
+            cmd->record_result = VK_ERROR_DEVICE_LOST;
+        return NULL;
+    }
+    struct mx_draw *op = append_operation(cmd, kind);
+    if (op) {
+        op->query_pool = owner;
+        op->first_query = first;
+        op->query_count = count;
+    }
+    return op;
+}
+
+static void cmd_reset_query_pool(VkCommandBuffer command, VkQueryPool pool, uint32_t first, uint32_t count)
+{
+    record_query(command, MX_OP_RESET_QUERIES, pool, first, count);
+}
+
+static void cmd_begin_query(VkCommandBuffer command, VkQueryPool pool, uint32_t query, VkQueryControlFlags flags)
+{
+    struct mx_cmd *cmd = (struct mx_cmd *)command;
+    struct mx_query_pool *owner = (struct mx_query_pool *)pool;
+    if (!owner || owner->type != VK_QUERY_TYPE_OCCLUSION || (flags & ~VK_QUERY_CONTROL_PRECISE_BIT) ||
+        (flags & VK_QUERY_CONTROL_PRECISE_BIT) || cmd->occlusion_pool) {
+        if (cmd->record_result == VK_SUCCESS)
+            cmd->record_result = VK_ERROR_DEVICE_LOST;
+        return;
+    }
+    if (record_query(command, MX_OP_BEGIN_QUERY, pool, query, 1)) {
+        cmd->occlusion_pool = owner;
+        cmd->occlusion_query = query;
+    }
+}
+
+static void cmd_end_query(VkCommandBuffer command, VkQueryPool pool, uint32_t query)
+{
+    struct mx_cmd *cmd = (struct mx_cmd *)command;
+    if (cmd->occlusion_pool != (struct mx_query_pool *)pool || cmd->occlusion_query != query) {
+        if (cmd->record_result == VK_SUCCESS)
+            cmd->record_result = VK_ERROR_DEVICE_LOST;
+        return;
+    }
+    cmd->occlusion_pool = NULL;
+    record_query(command, MX_OP_END_QUERY, pool, query, 1);
+}
+
+static void cmd_write_timestamp(VkCommandBuffer command, VkPipelineStageFlagBits stage, VkQueryPool pool, uint32_t query)
+{
+    (void)stage;
+    struct mx_query_pool *owner = (struct mx_query_pool *)pool;
+    if (!owner || owner->type != VK_QUERY_TYPE_TIMESTAMP) {
+        struct mx_cmd *cmd = (struct mx_cmd *)command;
+        if (cmd->record_result == VK_SUCCESS)
+            cmd->record_result = VK_ERROR_DEVICE_LOST;
+        return;
+    }
+    record_query(command, MX_OP_TIMESTAMP, pool, query, 1);
+}
+
+static void cmd_copy_query_pool_results(VkCommandBuffer command, VkQueryPool pool, uint32_t first, uint32_t count,
+                                        VkBuffer buffer, VkDeviceSize offset, VkDeviceSize stride,
+                                        VkQueryResultFlags flags)
+{
+    struct mx_draw *op = record_query(command, MX_OP_COPY_QUERIES, pool, first, count);
+    if (!op)
+        return;
+    op->copy_dst = (struct mx_buf *)buffer;
+    op->copy_region.dstOffset = offset;
+    op->query_stride = stride;
+    op->query_flags = flags;
+}
+
+static struct mx_draw *clone_operation(const struct mx_draw *source)
+{
+    struct mx_draw *copy = malloc(sizeof *copy);
+    if (!copy)
+        return NULL;
+    *copy = *source;
+    copy->next = NULL;
+    copy->state.bound_sets = NULL;
+    copy->state.bound_offsets = NULL;
+    copy->update_data = NULL;
+    copy->events = NULL;
+    for (unsigned stage = 0; stage < MXGPU_VK_STAGES; stage++)
+        for (unsigned word = 0; word < MXGPU_VK_PUSH_CONSTANT_BYTES / 4; word++)
+            retain_layout(copy->state.push_layouts[stage][word]);
+    uint32_t sets = source->state.bound_set_count;
+    bool ok = true;
+    if (sets && source->state.bound_sets) {
+        copy->state.bound_sets = malloc((size_t)sets * sizeof *copy->state.bound_sets);
+        ok = copy->state.bound_sets != NULL;
+        if (ok)
+            memcpy(copy->state.bound_sets, source->state.bound_sets, (size_t)sets * sizeof *copy->state.bound_sets);
+    }
+    if (ok && source->state.bound_offsets) {
+        copy->state.bound_offsets = calloc(sets, sizeof *copy->state.bound_offsets);
+        ok = copy->state.bound_offsets != NULL;
+        for (uint32_t i = 0; ok && i < sets; i++) {
+            uint32_t count = source->state.bound_offsets[i].count;
+            if (!count)
+                continue;
+            copy->state.bound_offsets[i].values = malloc((size_t)count * sizeof(uint32_t));
+            ok = copy->state.bound_offsets[i].values != NULL;
+            if (ok) {
+                copy->state.bound_offsets[i].count = count;
+                memcpy(copy->state.bound_offsets[i].values, source->state.bound_offsets[i].values,
+                       (size_t)count * sizeof(uint32_t));
+            }
+        }
+    }
+    if (ok && source->update_data) {
+        copy->update_data = malloc((size_t)source->copy_region.size);
+        ok = copy->update_data != NULL;
+        if (ok)
+            memcpy(copy->update_data, source->update_data, (size_t)source->copy_region.size);
+    }
+    if (ok && source->events && source->event_count) {
+        copy->events = malloc((size_t)source->event_count * sizeof *copy->events);
+        ok = copy->events != NULL;
+        if (ok)
+            memcpy(copy->events, source->events, (size_t)source->event_count * sizeof *copy->events);
+    }
+    if (!ok) {
+        struct mx_cmd holder = {.draws = copy};
+        free_draws(&holder);
+        return NULL;
+    }
+    return copy;
+}
+
+static void cmd_execute_commands(VkCommandBuffer command, uint32_t count, const VkCommandBuffer *commands)
+{
+    struct mx_cmd *cmd = (struct mx_cmd *)command;
+    if (cmd->record_result != VK_SUCCESS)
+        return;
+    if (!cmd->open || cmd->level != VK_COMMAND_BUFFER_LEVEL_PRIMARY || (count && !commands)) {
+        cmd->record_result = VK_ERROR_DEVICE_LOST;
+        return;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        struct mx_cmd *secondary = (struct mx_cmd *)commands[i];
+        if (!secondary || secondary->open || secondary->level != VK_COMMAND_BUFFER_LEVEL_SECONDARY ||
+            secondary->record_result != VK_SUCCESS) {
+            cmd->record_result = VK_ERROR_DEVICE_LOST;
+            return;
+        }
+        for (const struct mx_draw *op = secondary->draws; op; op = op->next) {
+            struct mx_draw *copy = clone_operation(op);
+            if (!copy) {
+                cmd->record_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+                return;
+            }
+            bool targets = copy->operation == MX_OP_DRAW || copy->operation == MX_OP_DRAW_INDIRECT ||
+                           (copy->operation == MX_OP_CLEAR_VIEW && !copy->clear_view);
+            if (targets && cmd->pass)
+                copy_target_state(&copy->state, cmd);
+            if (cmd->occlusion_pool && !copy->state.occlusion_pool &&
+                (copy->operation == MX_OP_DRAW || copy->operation == MX_OP_DRAW_INDIRECT)) {
+                copy->state.occlusion_pool = cmd->occlusion_pool;
+                copy->state.occlusion_query = cmd->occlusion_query;
+            }
+            if (cmd->last_draw)
+                cmd->last_draw->next = copy;
+            else
+                cmd->draws = copy;
+            cmd->last_draw = copy;
+        }
+    }
+}
+
+static VkResult create_buffer_view(VkDevice device, const VkBufferViewCreateInfo *info,
+                                   const VkAllocationCallbacks *alloc, VkBufferView *out)
+{
+    struct mx_buf *buffer = (struct mx_buf *)info->buffer;
+    enum pipe_format format = vk_vertex_format(info->format);
+    (void)device;
+    (void)alloc;
+    *out = VK_NULL_HANDLE;
+    if (!buffer || format == PIPE_FORMAT_NONE || info->offset > buffer->size)
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    unsigned texel = util_format_get_blocksize(format);
+    VkDeviceSize range = info->range == VK_WHOLE_SIZE ? (buffer->size - info->offset) / texel * texel : info->range;
+    if (range > buffer->size - info->offset || range % texel)
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    struct mx_buffer_view *view = calloc(1, sizeof *view);
+    if (!view)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    *view = (struct mx_buffer_view){buffer, info->format, info->offset, range};
+    *out = (VkBufferView)view;
+    return VK_SUCCESS;
+}
+
+static void destroy_buffer_view(VkDevice device, VkBufferView view, const VkAllocationCallbacks *alloc)
+{
+    (void)device;
+    (void)alloc;
+    free(view);
+}
+
+static void image_subresource_layout(VkDevice device, VkImage handle, const VkImageSubresource *subresource,
+                                     VkSubresourceLayout *layout)
+{
+    struct mx_img *image = (struct mx_img *)handle;
+    uint32_t extent[3];
+    (void)device;
+    memset(layout, 0, sizeof *layout);
+    if (!image || subresource->mipLevel >= image->levels || subresource->arrayLayer >= image->layers)
+        return;
+    VkDeviceSize texel = (VkDeviceSize)vk_format_bytes(image->format) * image->samples;
+    layout->offset = vk_subresource_offset(image, subresource->mipLevel, subresource->arrayLayer, extent);
+    layout->rowPitch = extent[0] * texel;
+    layout->depthPitch = layout->rowPitch * extent[1];
+    layout->size = layout->depthPitch * extent[2];
+    layout->arrayPitch = layout->size;
+}
+
+static void render_area_granularity(VkDevice device, VkRenderPass pass, VkExtent2D *granularity)
+{
+    (void)device;
+    (void)pass;
+    *granularity = (VkExtent2D){1, 1};
+}
+
+static VkResult instance_layers(uint32_t *count, VkLayerProperties *properties)
+{
+    (void)properties;
+    *count = 0;
+    return VK_SUCCESS;
+}
+
+static VkResult device_layers(VkPhysicalDevice physical, uint32_t *count, VkLayerProperties *properties)
+{
+    (void)physical;
+    (void)properties;
+    *count = 0;
+    return VK_SUCCESS;
+}
+
+static VkResult mapped_ranges(VkDevice device, uint32_t count, const VkMappedMemoryRange *ranges)
+{
+    struct mx_device *owner = (struct mx_device *)device;
+    if (owner && atomic_load_explicit(&owner->lost, memory_order_acquire))
+        return VK_ERROR_DEVICE_LOST;
+    for (uint32_t i = 0; i < count; i++) {
+        struct mx_mem *mem = (struct mx_mem *)ranges[i].memory;
+        if (!mem || !mem->mapped || ranges[i].offset > mem->size ||
+            (ranges[i].size != VK_WHOLE_SIZE && ranges[i].size > mem->size - ranges[i].offset))
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    atomic_thread_fence(memory_order_seq_cst);
+    return VK_SUCCESS;
+}
+
+static void memory_commitment(VkDevice device, VkDeviceMemory memory, VkDeviceSize *committed)
+{
+    (void)device;
+    *committed = memory ? ((struct mx_mem *)memory)->size : 0;
+}
+
+static VkResult semaphore_transition(struct mx_device *device, VkSemaphore handle, int signal);
+
+static VkResult queue_bind_sparse(VkQueue queue, uint32_t count, const VkBindSparseInfo *infos, VkFence fence)
+{
+    struct mx_device *device = queue ? ((struct mx_queue *)queue)->device : NULL;
+    if (device && atomic_load_explicit(&device->lost, memory_order_acquire))
+        return VK_ERROR_DEVICE_LOST;
+    for (uint32_t i = 0; i < count; i++)
+        if (infos[i].bufferBindCount || infos[i].imageOpaqueBindCount || infos[i].imageBindCount) {
+            if (device)
+                atomic_store_explicit(&device->lost, 1, memory_order_release);
+            return VK_ERROR_DEVICE_LOST;
+        }
+    for (uint32_t i = 0; i < count; i++) {
+        for (uint32_t s = 0; s < infos[i].waitSemaphoreCount; s++) {
+            VkResult result = semaphore_transition(device, infos[i].pWaitSemaphores[s], 0);
+            if (result != VK_SUCCESS)
+                return result;
+        }
+        for (uint32_t s = 0; s < infos[i].signalSemaphoreCount; s++) {
+            VkResult result = semaphore_transition(device, infos[i].pSignalSemaphores[s], 1);
+            if (result != VK_SUCCESS)
+                return result;
+        }
+    }
+    if (fence)
+        ((struct mx_fence *)fence)->signaled = 1;
     return VK_SUCCESS;
 }
 
@@ -3837,10 +5471,7 @@ static VkResult queue_submit(VkQueue queue, uint32_t count, const VkSubmitInfo *
             struct mx_cmd *cmd = (struct mx_cmd *)submits[i].pCommandBuffers[c];
             struct mx_draw *draw;
             for (draw = cmd->draws; draw; draw = draw->next) {
-                VkResult result = draw->operation == 5 ? perform_dispatch(draw) :
-                                  draw->operation == 4 ? perform_pipeline_barrier() :
-                                  draw->operation == 1 ? perform_buffer_copy(draw) :
-                                  draw->operation >= 2 ? perform_buffer_image_copy(draw) : perform_draw(&draw->state);
+                VkResult result = perform_operation(draw);
                 if (result != VK_SUCCESS) {
                     if (device && result == VK_ERROR_DEVICE_LOST)
                         atomic_store_explicit(&device->lost, 1, memory_order_release);
@@ -4486,6 +6117,50 @@ static PFN_vkVoidFunction device_proc(const char *name)
     if (strcmp(name, "vkUpdateDescriptorSetWithTemplate") == 0) return (PFN_vkVoidFunction)update_set_with_template;
     if (strcmp(name, "vkCreateSamplerYcbcrConversion") == 0) return (PFN_vkVoidFunction)create_ycbcr_conversion;
     if (strcmp(name, "vkDestroySamplerYcbcrConversion") == 0) return (PFN_vkVoidFunction)destroy_ycbcr_conversion;
+    static const struct { const char *name; PFN_vkVoidFunction function; } added[] = {
+        {"vkFlushMappedMemoryRanges", (PFN_vkVoidFunction)mapped_ranges},
+        {"vkInvalidateMappedMemoryRanges", (PFN_vkVoidFunction)mapped_ranges},
+        {"vkGetDeviceMemoryCommitment", (PFN_vkVoidFunction)memory_commitment},
+        {"vkQueueBindSparse", (PFN_vkVoidFunction)queue_bind_sparse},
+        {"vkCreateQueryPool", (PFN_vkVoidFunction)create_query_pool},
+        {"vkDestroyQueryPool", (PFN_vkVoidFunction)destroy_query_pool},
+        {"vkGetQueryPoolResults", (PFN_vkVoidFunction)query_pool_results},
+        {"vkGetImageSubresourceLayout", (PFN_vkVoidFunction)image_subresource_layout},
+        {"vkCmdCopyImage", (PFN_vkVoidFunction)cmd_copy_image},
+        {"vkCmdUpdateBuffer", (PFN_vkVoidFunction)cmd_update_buffer},
+        {"vkCmdFillBuffer", (PFN_vkVoidFunction)cmd_fill_buffer},
+        {"vkCmdBeginQuery", (PFN_vkVoidFunction)cmd_begin_query},
+        {"vkCmdEndQuery", (PFN_vkVoidFunction)cmd_end_query},
+        {"vkCmdResetQueryPool", (PFN_vkVoidFunction)cmd_reset_query_pool},
+        {"vkCmdWriteTimestamp", (PFN_vkVoidFunction)cmd_write_timestamp},
+        {"vkCmdCopyQueryPoolResults", (PFN_vkVoidFunction)cmd_copy_query_pool_results},
+        {"vkCmdExecuteCommands", (PFN_vkVoidFunction)cmd_execute_commands},
+        {"vkCreateEvent", (PFN_vkVoidFunction)create_event},
+        {"vkDestroyEvent", (PFN_vkVoidFunction)destroy_event},
+        {"vkGetEventStatus", (PFN_vkVoidFunction)event_status},
+        {"vkSetEvent", (PFN_vkVoidFunction)set_event},
+        {"vkResetEvent", (PFN_vkVoidFunction)reset_event},
+        {"vkCreateBufferView", (PFN_vkVoidFunction)create_buffer_view},
+        {"vkDestroyBufferView", (PFN_vkVoidFunction)destroy_buffer_view},
+        {"vkCmdClearColorImage", (PFN_vkVoidFunction)cmd_clear_color_image},
+        {"vkCmdSetEvent", (PFN_vkVoidFunction)cmd_set_event},
+        {"vkCmdResetEvent", (PFN_vkVoidFunction)cmd_reset_event},
+        {"vkCmdWaitEvents", (PFN_vkVoidFunction)cmd_wait_events},
+        {"vkGetRenderAreaGranularity", (PFN_vkVoidFunction)render_area_granularity},
+        {"vkCmdSetLineWidth", (PFN_vkVoidFunction)cmd_set_line_width},
+        {"vkCmdSetDepthBias", (PFN_vkVoidFunction)cmd_set_depth_bias},
+        {"vkCmdSetDepthBounds", (PFN_vkVoidFunction)cmd_set_depth_bounds},
+        {"vkCmdDrawIndirect", (PFN_vkVoidFunction)cmd_draw_indirect},
+        {"vkCmdDrawIndexedIndirect", (PFN_vkVoidFunction)cmd_draw_indexed_indirect},
+        {"vkCmdBlitImage", (PFN_vkVoidFunction)cmd_blit_image},
+        {"vkCmdClearDepthStencilImage", (PFN_vkVoidFunction)cmd_clear_depth_stencil_image},
+        {"vkCmdClearAttachments", (PFN_vkVoidFunction)cmd_clear_attachments},
+        {"vkCmdResolveImage", (PFN_vkVoidFunction)cmd_resolve_image},
+        {"vkCmdNextSubpass", (PFN_vkVoidFunction)cmd_next_subpass},
+    };
+    for (size_t i = 0; i < sizeof added / sizeof added[0]; i++)
+        if (!strcmp(name, added[i].name))
+            return added[i].function;
     return NULL;
 }
 
@@ -4495,6 +6170,9 @@ static void device_features(VkPhysicalDevice physical, VkPhysicalDeviceFeatures 
     memset(features, 0, sizeof *features);
     features->robustBufferAccess = VK_TRUE;
     features->fullDrawIndexUint32 = VK_TRUE;
+    features->independentBlend = VK_TRUE;
+    features->multiDrawIndirect = VK_TRUE;
+    features->depthBiasClamp = VK_TRUE;
 }
 
 static void format_properties(VkPhysicalDevice physical, VkFormat format, VkFormatProperties *properties)
@@ -4504,7 +6182,8 @@ static void format_properties(VkPhysicalDevice physical, VkFormat format, VkForm
     if (vk_color_format(format) != PIPE_FORMAT_NONE) {
         properties->linearTilingFeatures = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
             VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
-            VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+            VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+            VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
         if (mxgpu_native_render_available(-1))
             properties->linearTilingFeatures |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
         if (mxgpu_native_sampler_available(-1))
@@ -4817,26 +6496,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL enumerate_instance_version(uint32_t *versi
 
 static VkResult instance_extensions(const char *layer, uint32_t *count, VkExtensionProperties *properties)
 {
+    const uint32_t total = sizeof mx_instance_extensions / sizeof mx_instance_extensions[0];
     if (layer)
         return VK_ERROR_LAYER_NOT_PRESENT;
-#ifdef VK_USE_PLATFORM_WAYLAND_KHR
-    static const VkExtensionProperties extensions[] = {
-        {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_SURFACE_SPEC_VERSION},
-        {VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME, VK_KHR_WAYLAND_SURFACE_SPEC_VERSION},
-    };
     if (!properties) {
-        *count = 2;
+        *count = total;
         return VK_SUCCESS;
     }
-    uint32_t written = *count < 2 ? *count : 2;
-    memcpy(properties, extensions, written * sizeof *properties);
+    uint32_t written = *count < total ? *count : total;
+    memcpy(properties, mx_instance_extensions, written * sizeof *properties);
     *count = written;
-    return written < 2 ? VK_INCOMPLETE : VK_SUCCESS;
-#else
-    (void)properties;
-    *count = 0;
-    return VK_SUCCESS;
-#endif
+    return written < total ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
 static const VkExtensionProperties mx_device_extensions[] = {
@@ -4886,6 +6556,8 @@ static PFN_vkVoidFunction instance_proc(const char *name)
 #endif
     if (strcmp(name, "vkEnumerateInstanceExtensionProperties") == 0) return (PFN_vkVoidFunction)instance_extensions;
     if (strcmp(name, "vkEnumerateDeviceExtensionProperties") == 0) return (PFN_vkVoidFunction)device_extensions;
+    if (strcmp(name, "vkEnumerateInstanceLayerProperties") == 0) return (PFN_vkVoidFunction)instance_layers;
+    if (strcmp(name, "vkEnumerateDeviceLayerProperties") == 0) return (PFN_vkVoidFunction)device_layers;
     if (strcmp(name, "vkGetPhysicalDeviceFeatures") == 0) return (PFN_vkVoidFunction)device_features;
     if (strcmp(name, "vkGetPhysicalDeviceFormatProperties") == 0) return (PFN_vkVoidFunction)format_properties;
     if (strcmp(name, "vkGetPhysicalDeviceImageFormatProperties") == 0) return (PFN_vkVoidFunction)image_format_properties;
@@ -4900,7 +6572,16 @@ static PFN_vkVoidFunction instance_proc(const char *name)
     if (strcmp(name, "vkGetDeviceProcAddr") == 0) return (PFN_vkVoidFunction)get_device_proc;
     if (strcmp(name, "vkEnumerateInstanceVersion") == 0) return (PFN_vkVoidFunction)enumerate_instance_version;
     if (strcmp(name, "vkEnumeratePhysicalDeviceGroups") == 0) return (PFN_vkVoidFunction)enum_device_groups;
-    if (strcmp(name, "vkGetPhysicalDeviceFeatures2") == 0) return (PFN_vkVoidFunction)device_features2;
+    if (strcmp(name, "vkGetPhysicalDeviceFeatures2") == 0 || strcmp(name, "vkGetPhysicalDeviceFeatures2KHR") == 0)
+        return (PFN_vkVoidFunction)device_features2;
+    if (strcmp(name, "vkGetPhysicalDeviceProperties2KHR") == 0) return (PFN_vkVoidFunction)device_props2;
+    if (strcmp(name, "vkGetPhysicalDeviceFormatProperties2KHR") == 0) return (PFN_vkVoidFunction)format_properties2;
+    if (strcmp(name, "vkGetPhysicalDeviceImageFormatProperties2KHR") == 0)
+        return (PFN_vkVoidFunction)image_format_properties2;
+    if (strcmp(name, "vkGetPhysicalDeviceQueueFamilyProperties2KHR") == 0) return (PFN_vkVoidFunction)queue_props2;
+    if (strcmp(name, "vkGetPhysicalDeviceMemoryProperties2KHR") == 0) return (PFN_vkVoidFunction)mem_props2;
+    if (strcmp(name, "vkGetPhysicalDeviceSparseImageFormatProperties2KHR") == 0)
+        return (PFN_vkVoidFunction)sparse_format_properties2;
     if (strcmp(name, "vkGetPhysicalDeviceProperties2") == 0) return (PFN_vkVoidFunction)device_props2;
     if (strcmp(name, "vkGetPhysicalDeviceFormatProperties2") == 0) return (PFN_vkVoidFunction)format_properties2;
     if (strcmp(name, "vkGetPhysicalDeviceImageFormatProperties2") == 0) return (PFN_vkVoidFunction)image_format_properties2;

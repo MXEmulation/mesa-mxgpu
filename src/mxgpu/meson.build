@@ -87,5 +87,19 @@ if get_option('mxgpu-tests')
     endforeach
     executable('vk_core11', files('vk_core11.c') + core11_shaders,
                dependencies : [vulkan_loader])
+    features_shaders = []
+    foreach shader : [
+      ['features.vert', 'features-vert.h', 'features_vertex'],
+      ['features-mrt.frag', 'features-mrt-frag.h', 'features_mrt'],
+      ['features-sampler.frag', 'features-sampler-frag.h', 'features_sampler'],
+      ['features-color.frag', 'features-color-frag.h', 'features_color'],
+    ]
+      features_shaders += custom_target(
+        shader[1], input : shader[0], output : shader[1],
+        command : [glslang, '-V', '--target-env', 'vulkan1.1', '--vn', shader[2], '-o', '@OUTPUT@', '@INPUT@'],
+      )
+    endforeach
+    executable('vk_features', files('vk_features.c') + features_shaders,
+               dependencies : [vulkan_loader, cc.find_library('m', required : false)])
   endif
 endif
