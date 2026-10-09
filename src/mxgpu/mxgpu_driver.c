@@ -34,6 +34,8 @@
 #define MXGPU_UNIFORM_CACHE_ENTRIES 8u
 #define MXGPU_UNIFORM_CACHE_BYTES (8ull * 1024u * 1024u)
 #define MXGPU_TEXTURE_CACHE_BYTES (128ull * 1024u * 1024u)
+#define MXGPU_MODULE_CACHE_ENTRIES 64u
+#define MXGPU_STATE_CACHE_ENTRIES 32u
 
 struct resource {
     int live;
@@ -118,7 +120,7 @@ struct scratch_buffer {
 
 struct mxgpu_framebuffer {
     unsigned char *pixels;
-    uint32_t width, height, size;
+    uint32_t width, height, size, format, pixel_bytes;
     uint64_t cpu_revision;
     int valid, pending, error, unpublished, clear_pending;
     unsigned char clear_bytes[4];
@@ -129,7 +131,7 @@ struct mxgpu_framebuffer {
 };
 
 struct device {
-    struct mxgpu_framebuffer *framebuffer;
+    struct mxgpu_framebuffer *framebuffer, *depth_framebuffer;
     struct mxgpu_framebuffer *framebuffer_cache[MXGPU_FRAMEBUFFER_CACHE_ENTRIES];
     uint64_t framebuffer_clock;
     unsigned immediate_color_id;
@@ -154,7 +156,7 @@ struct device {
     unsigned uniform_size[2];
     struct uniform_cache_entry uniform_cache[2][MXGPU_UNIFORM_CACHE_ENTRIES];
     uint64_t uniform_cache_clock;
-    struct native_pipeline_cache_entry module_cache[8];
+    struct native_pipeline_cache_entry module_cache[MXGPU_MODULE_CACHE_ENTRIES];
     uint32_t module_cache_next_id;
     struct compute_pipeline_entry compute_pipes[MXGPU_COMPUTE_PIPELINES];
     uint64_t module_cache_clock;
@@ -186,10 +188,10 @@ struct device {
     struct mxgpu_format_capabilities format_caps;
     int format_caps_valid;
     uint32_t active_depth_id;
-    struct native_state_cache_entry depth_cache[4];
+    struct native_state_cache_entry depth_cache[MXGPU_STATE_CACHE_ENTRIES];
     uint32_t active_blend_id, active_rasterizer_id, active_sampler_ids[MXGPU_TEXTURE_INPUTS];
     uint64_t native_cache_clock;
-    struct native_state_cache_entry blend_cache[4], rasterizer_cache[4], sampler_cache[MXGPU_TEXTURE_INPUTS];
+    struct native_state_cache_entry blend_cache[MXGPU_STATE_CACHE_ENTRIES], rasterizer_cache[MXGPU_STATE_CACHE_ENTRIES], sampler_cache[MXGPU_STATE_CACHE_ENTRIES];
     const struct mxgpu_texture_input *draw_textures;
     uint32_t draw_texture_count;
     unsigned texture_ids[MXGPU_TEXTURE_INPUTS];
@@ -415,6 +417,23 @@ static int batch_drain_unlocked(void)
     uint8_t *record = scratch_reserve(&g_dev.batch_record, capacity);
     uint32_t bytes;
     if (!record) return -1;
+    struct mxgpu_drm_batch_command commands[MXGPU_DRM_BATCH_MAX_COMMANDS];
+    uint32_t offsets[MXGPU_DRM_BATCH_MAX_COMMANDS];
+    uint64_t sequences[MXGPU_DRM_BATCH_MAX_COMMANDS];
+    uint16_t opcodes[MXGPU_DRM_BATCH_MAX_COMMANDS];
+    unsigned ordered = 0;
+    for (unsigned pass = 0; pass < 2; pass++)
+        for (unsigned i = 0; i < g_dev.batch.count; i++) {
+            if ((g_dev.batch_opcodes[i] == MXGPU_OP_TRANSFER_TO_HOST) != !pass) continue;
+            commands[ordered] = g_dev.batch.commands[i];
+            offsets[ordered] = g_dev.batch_offsets[i];
+            sequences[ordered] = g_dev.batch_sequences[i];
+            opcodes[ordered++] = g_dev.batch_opcodes[i];
+        }
+    memcpy(g_dev.batch.commands, commands, ordered * sizeof commands[0]);
+    memcpy(g_dev.batch_offsets, offsets, ordered * sizeof offsets[0]);
+    memcpy(g_dev.batch_sequences, sequences, ordered * sizeof sequences[0]);
+    memcpy(g_dev.batch_opcodes, opcodes, ordered * sizeof opcodes[0]);
     for (unsigned i = 0; i < g_dev.batch.count; i++)
         g_dev.batch.commands[i].command = g_dev.batch_commands.bytes + g_dev.batch_offsets[i];
     if (mxgpu_drm_batch_encode(&g_dev.batch, record, capacity, &bytes) != MXGPU_DRM_OK) return -1;
@@ -485,6 +504,10 @@ static int batch_enqueue_unlocked(uint16_t opcode, uint16_t queue, uint32_t cont
             unsigned id = render.color_targets[i].resource_id;
             if (!id || id >= MXGPU_RESOURCE_SLOTS) return -1;
             pins[id] = 1;
+        }
+        if (render.depth_stencil_target_id) {
+            if (render.depth_stencil_target_id >= MXGPU_RESOURCE_SLOTS) return -1;
+            pins[render.depth_stencil_target_id] = 1;
         }
         for (unsigned i = 0; i < render.binding_count; i++) {
             if (bindings[i].kind == MXGPU_BIND_KIND_SAMPLER) continue;
@@ -674,13 +697,13 @@ static int native_cache_acquire(struct native_state_cache_entry *cache, unsigned
 static void native_cache_release_all(void)
 {
     unsigned i;
-    for (i = 0; i < 4 && !g_dev.lost; i++)
+    for (i = 0; i < MXGPU_STATE_CACHE_ENTRIES && !g_dev.lost; i++)
         native_cache_destroy(&g_dev.depth_cache[i], MXGPU_OP_DEPTH_STENCIL_STATE_DESTROY);
-    for (i = 0; i < 4 && !g_dev.lost; i++)
+    for (i = 0; i < MXGPU_STATE_CACHE_ENTRIES && !g_dev.lost; i++)
         native_cache_destroy(&g_dev.blend_cache[i], MXGPU_OP_BLEND_STATE_DESTROY);
-    for (i = 0; i < 4 && !g_dev.lost; i++)
+    for (i = 0; i < MXGPU_STATE_CACHE_ENTRIES && !g_dev.lost; i++)
         native_cache_destroy(&g_dev.rasterizer_cache[i], MXGPU_OP_RASTERIZER_STATE_DESTROY);
-    for (i = 0; i < MXGPU_TEXTURE_INPUTS && !g_dev.lost; i++)
+    for (i = 0; i < MXGPU_STATE_CACHE_ENTRIES && !g_dev.lost; i++)
         native_cache_destroy(&g_dev.sampler_cache[i], MXGPU_OP_SAMPLER_DESTROY);
 }
 
@@ -1704,7 +1727,7 @@ static int ensure_native_pipeline(void)
     uint32_t bytes;
     unsigned i;
     if (g_dev.lost) return -1;
-    for (i = 0; i < 8; i++) {
+    for (i = 0; i < MXGPU_MODULE_CACHE_ENTRIES; i++) {
         struct native_pipeline_cache_entry *candidate = &g_dev.module_cache[i];
         if (candidate->module && candidate->bytes == g_user_len &&
             memcmp(candidate->module, g_user_mod, g_user_len) == 0) {
@@ -1758,17 +1781,26 @@ static int ensure_native_pipeline(void)
     return 0;
 }
 
+static int module_verified_unlocked(const uint8_t *module, uint32_t module_len)
+{
+    struct mxsb_limits limits;
+    if (g_user_len == module_len && !memcmp(g_user_mod, module, module_len))
+        return 1;
+    for (unsigned i = 0; i < MXGPU_MODULE_CACHE_ENTRIES; i++)
+        if (g_dev.module_cache[i].module && g_dev.module_cache[i].bytes == module_len &&
+            !memcmp(g_dev.module_cache[i].module, module, module_len))
+            return 1;
+    mxsb_limits_default(&limits);
+    return mxsb_verify(module, module_len, &limits) == MXSB_OK;
+}
+
 static int ensure_pipeline(void)
 {
     uint8_t payload[64];
     uint32_t n = 0;
-    struct mxsb_limits limits;
     if (g_dev.fd < 0 && g_dev.pipeline_live && !g_dev.pipeline_dirty)
         return 0;
     if (!g_user_len)
-        return -1;
-    mxsb_limits_default(&limits);
-    if (mxsb_verify(g_user_mod, g_user_len, &limits) != MXSB_OK)
         return -1;
     if (g_dev.fd >= 0)
         return ensure_native_pipeline();
@@ -1999,7 +2031,7 @@ static int framebuffer_sync_unlocked(struct mxgpu_framebuffer *framebuffer)
         return result;
     }
     color->host_current = 1;
-    size_t row = (size_t)framebuffer->width * 4u;
+    size_t row = (size_t)framebuffer->width * framebuffer->pixel_bytes;
     memcpy(framebuffer->pixels + first * row, color->bytes + first * row, (end - first) * row);
     framebuffer_rows_add(&framebuffer->unpublished_top, &framebuffer->unpublished_bottom, first, end);
     framebuffer->pending = 0;
@@ -2037,6 +2069,7 @@ static int framebuffer_release_resource_unlocked(struct mxgpu_framebuffer *frame
 
 static int framebuffer_sample_pinned(const struct mxgpu_framebuffer *framebuffer)
 {
+    if (framebuffer && framebuffer == g_dev.depth_framebuffer) return 1;
     if (framebuffer && framebuffer->resource_id && g_dev.resources[framebuffer->resource_id].batch_pinned) return 1;
     for (unsigned i = 0; i < g_dev.draw_texture_count; i++)
         if (g_dev.draw_textures[i].framebuffer == framebuffer) return 1;
@@ -2073,7 +2106,7 @@ static int framebuffer_trim_bytes_unlocked(struct mxgpu_framebuffer *preserve)
     return 0;
 }
 
-static int framebuffer_resource_acquire_unlocked(struct mxgpu_framebuffer *framebuffer)
+static int framebuffer_resource_reserve_unlocked(struct mxgpu_framebuffer *framebuffer)
 {
     if (framebuffer->resource_blocked && framebuffer_release_resource_unlocked(framebuffer)) return -1;
     if (g_dev.fd >= 0 && (query_adapter_unlocked() ||
@@ -2091,10 +2124,17 @@ static int framebuffer_resource_acquire_unlocked(struct mxgpu_framebuffer *frame
         unsigned id = new_resource(MXGPU_KIND_TEXTURE_2D, framebuffer->width,
                                    framebuffer->height, framebuffer->size);
         if (!id) return -1;
+        if (framebuffer->format != MXGPU_FMT_RGBA8_UNORM) g_dev.resources[id].format = framebuffer->format;
         framebuffer->resource_id = id;
         g_dev.framebuffer_cache[slot] = framebuffer;
     }
     framebuffer->used = ++g_dev.framebuffer_clock;
+    return 0;
+}
+
+static int framebuffer_resource_acquire_unlocked(struct mxgpu_framebuffer *framebuffer)
+{
+    if (framebuffer_resource_reserve_unlocked(framebuffer)) return -1;
     g_dev.framebuffer = framebuffer;
     g_dev.color_id = framebuffer->resource_id;
     g_needs_clear = 0;
@@ -2112,7 +2152,36 @@ struct mxgpu_framebuffer *mxgpu_framebuffer_create(uint32_t width, uint32_t heig
     if (!framebuffer->pixels) { free(framebuffer); return NULL; }
     framebuffer->width = width;
     framebuffer->height = height;
+    framebuffer->format = MXGPU_FMT_RGBA8_UNORM;
+    framebuffer->pixel_bytes = 4u;
     return framebuffer;
+}
+
+struct mxgpu_framebuffer *mxgpu_depth_framebuffer_create(uint32_t width, uint32_t height, uint32_t format)
+{
+    uint32_t pixel_bytes = format == MXGPU_FMT_DEPTH32_FLOAT_STENCIL8 ? 8u : 4u;
+    if ((format != MXGPU_FMT_DEPTH32_FLOAT && format != MXGPU_FMT_DEPTH32_FLOAT_STENCIL8 &&
+         format != MXGPU_FMT_DEPTH24_UNORM_STENCIL8) || !width || !height || width > 2048 || height > 2048 ||
+        (uint64_t)width * height > UINT_MAX / pixel_bytes) return NULL;
+    struct mxgpu_framebuffer *framebuffer = calloc(1, sizeof *framebuffer);
+    if (!framebuffer) return NULL;
+    framebuffer->size = width * height * pixel_bytes;
+    framebuffer->pixels = malloc(framebuffer->size);
+    if (!framebuffer->pixels) { free(framebuffer); return NULL; }
+    framebuffer->width = width;
+    framebuffer->height = height;
+    framebuffer->format = format;
+    framebuffer->pixel_bytes = pixel_bytes;
+    return framebuffer;
+}
+
+int mxgpu_framebuffer_current(struct mxgpu_framebuffer *framebuffer, uint64_t cpu_revision)
+{
+    pthread_mutex_lock(&g_device_mutex);
+    int current = framebuffer && framebuffer->valid && !framebuffer->error &&
+        framebuffer->cpu_revision == cpu_revision;
+    pthread_mutex_unlock(&g_device_mutex);
+    return current;
 }
 
 int mxgpu_framebuffer_sync(struct mxgpu_framebuffer *framebuffer, unsigned char *destination,
@@ -2122,14 +2191,16 @@ int mxgpu_framebuffer_sync(struct mxgpu_framebuffer *framebuffer, unsigned char 
     if (changed) *changed = 0;
     pthread_mutex_lock(&g_device_mutex);
     int result = !framebuffer || !destination || !convert || !framebuffer->valid ||
-        destination_stride < framebuffer->width * 4u ? -1 : framebuffer_sync_unlocked(framebuffer);
+        (framebuffer->format == MXGPU_FMT_RGBA8_UNORM && destination_stride < framebuffer->width * 4u) ?
+        -1 : framebuffer_sync_unlocked(framebuffer);
     if (!result) {
         uint32_t first = all_rows ? 0 : framebuffer->unpublished_top;
         uint32_t end = all_rows ? framebuffer->height : framebuffer->unpublished_bottom;
         if (end > framebuffer->height) end = framebuffer->height;
         for (uint32_t y = first; y < end; y++)
             convert(destination + (size_t)y * destination_stride,
-                    framebuffer->pixels + (size_t)y * framebuffer->width * 4u, framebuffer->width, convert_arg);
+                    framebuffer->pixels + (size_t)y * framebuffer->width * framebuffer->pixel_bytes,
+                    framebuffer->width, convert_arg);
         if (changed) *changed = framebuffer->unpublished;
         framebuffer->unpublished = 0;
         framebuffer->unpublished_top = framebuffer->unpublished_bottom = 0;
@@ -2169,7 +2240,8 @@ int mxgpu_framebuffer_refresh(struct mxgpu_framebuffer *framebuffer, const unsig
         res_slot(framebuffer->resource_id) : NULL;
     size_t row = framebuffer ? (size_t)framebuffer->width * 4u : 0;
     unsigned char *converted = row ? scratch_reserve(&g_dev.readback_scratch, (uint32_t)row) : NULL;
-    int result = !framebuffer || !source || !convert || !converted || g_dev.lost || !framebuffer->valid ||
+    int result = !framebuffer || framebuffer->format != MXGPU_FMT_RGBA8_UNORM ||
+        !source || !convert || !converted || g_dev.lost || !framebuffer->valid ||
         framebuffer->error || framebuffer->pending || framebuffer->clear_pending || framebuffer->resource_blocked ||
         source_stride < row || (framebuffer->resource_id && (!resource || resource->width != framebuffer->width ||
         resource->height != framebuffer->height || resource->size != framebuffer->size || !resource->bytes)) ? -1 : 0;
@@ -2207,7 +2279,7 @@ int mxgpu_framebuffer_clear(struct mxgpu_framebuffer *framebuffer, const unsigne
     pthread_mutex_lock(&g_device_mutex);
     struct resource *resource = framebuffer && framebuffer->resource_id ?
         res_slot(framebuffer->resource_id) : NULL;
-    int result = !framebuffer || !rgba || g_dev.lost || framebuffer->error ||
+    int result = !framebuffer || framebuffer->format != MXGPU_FMT_RGBA8_UNORM || !rgba || g_dev.lost || framebuffer->error ||
         framebuffer->resource_blocked || (framebuffer->resource_id &&
         (!resource || resource->width != framebuffer->width ||
          resource->height != framebuffer->height || resource->size != framebuffer->size)) ? -1 : 0;
@@ -2674,6 +2746,7 @@ static int draw_scene(void)
     struct mxgpu_framebuffer *clear_target = g_dev.native_active && g_dev.framebuffer &&
         g_dev.framebuffer->clear_pending && g_dev.framebuffer->resource_id == g_dev.color_id ?
         g_dev.framebuffer : NULL;
+    unsigned depth_target = g_dev.depth_framebuffer ? g_dev.depth_framebuffer->resource_id : g_dev.depth_id;
     if (ensure_pipeline() != 0)
         return -1;
     if (create_buffer_resource(g_dev.vertex_id) != 0)
@@ -2753,7 +2826,7 @@ static int draw_scene(void)
         extended.blend_state_id = g_dev.active_blend_id;
         if (g_dev.native_state.depth_enabled) {
             extended.depth_stencil_state_id = g_dev.active_depth_id;
-            extended.depth_stencil_target_id = g_dev.depth_id;
+            extended.depth_stencil_target_id = depth_target;
             extended.depth_load_action = MXGPU_LOAD_LOAD;
             extended.depth_store_action = MXGPU_STORE_STORE;
             extended.stencil_load_action = MXGPU_LOAD_LOAD;
@@ -2785,8 +2858,11 @@ static int draw_scene(void)
             return -1;
     } else if (mxgpu_render_submit_encode(&submit, bindings, payload, sizeof payload, &n) != MX_OK)
         return -1;
-    if (g_dev.native_active && g_dev.native_state.depth_enabled)
-        g_dev.resources[g_dev.depth_id].host_current = 0;
+    if (g_dev.native_active && g_dev.native_state.depth_enabled &&
+        (!g_dev.depth_framebuffer || mxgpu_depth_stencil_writes(&g_dev.native_state.depth_stencil))) {
+        g_dev.resources[depth_target].host_current = 0;
+        g_dev.resources[depth_target].upload_scheduled = 0;
+    }
     if (g_dev.native_active && g_dev.fd >= 0) {
         g_dev.resources[g_dev.color_id].host_current = 0;
         g_dev.resources[g_dev.color_id].upload_scheduled = 0;
@@ -2794,6 +2870,7 @@ static int draw_scene(void)
     if (winsys_submit_ioctl(g_dev.native_active ? MXGPU_OP_RENDER_SUBMIT_EXTENDED : MXGPU_OP_RENDER_SUBMIT,
                             MXGPU_QUEUE_RENDER, g_dev.context, payload, n) != MX_OK) {
         if (g_dev.deferred_readback && g_dev.framebuffer) g_dev.framebuffer->error = 1;
+        if (g_dev.depth_framebuffer) g_dev.depth_framebuffer->error = 1;
         return -1;
     }
     g_needs_clear = 0;
@@ -3121,7 +3198,6 @@ static int mxgpu_execute_module_uniforms_unlocked(const uint8_t *module, uint32_
     uint32_t uniform_sizes[2] = {vertex_uniform_size, fragment_uniform_size};
     unsigned stage;
     if (!g_dev.deferred_readback && framebuffer_detach_unlocked()) return -1;
-    struct mxsb_limits limits;
     const char *inject;
     if (!module || module_len == 0 || module_len > sizeof g_user_mod || !vertices || vertex_count < 3 || (!texels && !g_dev.draw_texture_count) || tw < 1 || th < 1 || !color || cw < 1 || ch < 1 || cw > 2048 || ch > 2048)
         return -1;
@@ -3133,8 +3209,7 @@ static int mxgpu_execute_module_uniforms_unlocked(const uint8_t *module, uint32_
         if ((uniform_sizes[stage] && !uniforms[stage]) || uniform_sizes[stage] > UINT_MAX - 15u)
             return -1;
     }
-    mxsb_limits_default(&limits);
-    if (mxsb_verify(module, module_len, &limits) != MXSB_OK)
+    if (!module_verified_unlocked(module, module_len))
         return -1;
     if (g_user_len != module_len || memcmp(g_user_mod, module, module_len) != 0) {
         memcpy(g_user_mod, module, module_len);
@@ -3391,7 +3466,7 @@ static void mxgpu_device_close_unlocked(void)
     }
     g_dev.framebuffer = NULL;
     if (g_dev.fd >= 0 && g_dev.context_owned && g_dev.open && !g_dev.lost) {
-        for (i = 0; i < 8 && !g_dev.lost; i++)
+        for (i = 0; i < MXGPU_MODULE_CACHE_ENTRIES && !g_dev.lost; i++)
             native_pipeline_entry_destroy(&g_dev.module_cache[i]);
         for (i = 0; i < MXGPU_COMPUTE_PIPELINES && !g_dev.lost; i++)
             if (compute_pipeline_entry_destroy(&g_dev.compute_pipes[i]))
@@ -3414,7 +3489,7 @@ static void mxgpu_device_close_unlocked(void)
             winsys_submit_ioctl(MXGPU_OP_CONTEXT_DESTROY, MXGPU_QUEUE_CONTROL,
                                 g_dev.context, NULL, 0);
     }
-    for (i = 0; i < 8; i++) {
+    for (i = 0; i < MXGPU_MODULE_CACHE_ENTRIES; i++) {
         free(g_dev.module_cache[i].module);
         g_dev.module_cache[i].module = NULL;
     }
@@ -3616,16 +3691,21 @@ static int execute_module_transaction_resources(int fd, const uint8_t *module, u
     int result = -1;
     const char *operation = "device-open";
     unsigned sampler_count = texture_count ? texture_count : 1;
+    struct mxgpu_framebuffer *depth_framebuffer = state && state->depth_enabled ? state->depth.framebuffer : NULL;
     if (readback_complete)
         *readback_complete = 0;
     pthread_mutex_lock(&g_device_mutex);
     g_readback_done = 0;
-    if (framebuffer && (!state || state->depth_enabled || !initial_color ||
-        cw != (int)framebuffer->width || ch != (int)framebuffer->height)) goto invalid_arguments;
+    if (framebuffer && (!state || (state->depth_enabled && !depth_framebuffer) || !initial_color ||
+        cw != (int)framebuffer->width || ch != (int)framebuffer->height ||
+        framebuffer->format != MXGPU_FMT_RGBA8_UNORM)) goto invalid_arguments;
+    if (depth_framebuffer && (depth_framebuffer == framebuffer || depth_framebuffer->format != state->depth.format ||
+        depth_framebuffer->width != (uint32_t)cw || depth_framebuffer->height != (uint32_t)ch)) goto invalid_arguments;
     if (texture_count > MXGPU_TEXTURE_INPUTS || (texture_count && !textures)) goto invalid_arguments;
     for (unsigned i = 0; i < texture_count; i++) {
         const struct mxgpu_texture_input *input = &textures[i];
         if (input->framebuffer && (!state || input->framebuffer == framebuffer ||
+            input->framebuffer == depth_framebuffer || input->framebuffer->format != MXGPU_FMT_RGBA8_UNORM ||
             !input->framebuffer->valid || input->framebuffer->error ||
             input->framebuffer_revision != input->framebuffer->cpu_revision ||
             input->width != input->framebuffer->width || input->height != input->framebuffer->height ||
@@ -3689,7 +3769,8 @@ static int execute_module_transaction_resources(int fd, const uint8_t *module, u
                 unsigned pixel_bytes = state->depth.format == MXGPU_FMT_DEPTH32_FLOAT_STENCIL8 ? 8 : 4;
                 depth.state_id = 1;
                 operation = "depth-validate";
-                if (!state->depth.pixels || state->depth.width != (unsigned)cw || state->depth.height != (unsigned)ch ||
+                if ((!state->depth.pixels && !depth_framebuffer) ||
+                    state->depth.width != (unsigned)cw || state->depth.height != (unsigned)ch ||
                     !cw || !ch || (uint64_t)(unsigned)cw * (unsigned)ch > UINT32_MAX / pixel_bytes ||
                     state->stencil_reference > 255 ||
                     (state->depth.format == MXGPU_FMT_DEPTH32_FLOAT && depth.stencil_enable) ||
@@ -3699,23 +3780,23 @@ static int execute_module_transaction_resources(int fd, const uint8_t *module, u
             }
             if (!result) {
                 operation = "blend-cache";
-                result = native_cache_acquire(g_dev.blend_cache, 4, MXGPU_OP_BLEND_STATE_CREATE,
+                result = native_cache_acquire(g_dev.blend_cache, MXGPU_STATE_CACHE_ENTRIES, MXGPU_OP_BLEND_STATE_CREATE,
                     MXGPU_OP_BLEND_STATE_DESTROY, payloads[0], sizes[0], &g_dev.active_blend_id);
             }
             if (!result) {
                 operation = "rasterizer-cache";
-                result = native_cache_acquire(g_dev.rasterizer_cache, 4, MXGPU_OP_RASTERIZER_STATE_CREATE,
+                result = native_cache_acquire(g_dev.rasterizer_cache, MXGPU_STATE_CACHE_ENTRIES, MXGPU_OP_RASTERIZER_STATE_CREATE,
                     MXGPU_OP_RASTERIZER_STATE_DESTROY, payloads[1], sizes[1], &g_dev.active_rasterizer_id);
             }
             if (state->sampler_enabled) {
                 for (unsigned texture = 0; texture < sampler_count && !result; texture++) {
                     operation = "sampler-cache";
-                    result = native_cache_acquire(g_dev.sampler_cache, MXGPU_TEXTURE_INPUTS, MXGPU_OP_SAMPLER_CREATE,
+                    result = native_cache_acquire(g_dev.sampler_cache, MXGPU_STATE_CACHE_ENTRIES, MXGPU_OP_SAMPLER_CREATE,
                         MXGPU_OP_SAMPLER_DESTROY, payloads[2 + texture], sizes[2 + texture], &g_dev.active_sampler_ids[texture]);
                 }
             }
             if (!result && state->depth_enabled)
-                result = native_cache_acquire(g_dev.depth_cache, 4, MXGPU_OP_DEPTH_STENCIL_STATE_CREATE,
+                result = native_cache_acquire(g_dev.depth_cache, MXGPU_STATE_CACHE_ENTRIES, MXGPU_OP_DEPTH_STENCIL_STATE_CREATE,
                     MXGPU_OP_DEPTH_STENCIL_STATE_DESTROY, payloads[2 + MXGPU_TEXTURE_INPUTS],
                     sizes[2 + MXGPU_TEXTURE_INPUTS], &g_dev.active_depth_id);
             g_dev.native_active = !result;
@@ -3723,6 +3804,34 @@ static int execute_module_transaction_resources(int fd, const uint8_t *module, u
     }
     g_dev.draw_textures = textures;
     g_dev.draw_texture_count = texture_count;
+    if (!result && depth_framebuffer) {
+        int reseed = 0;
+        operation = "depth-acquire";
+        g_dev.depth_framebuffer = depth_framebuffer;
+        if (depth_framebuffer->error && depth_framebuffer->valid &&
+            depth_framebuffer->cpu_revision == state->depth.cpu_revision) result = -1;
+        else if (!depth_framebuffer->valid || depth_framebuffer->cpu_revision != state->depth.cpu_revision) {
+            if ((depth_framebuffer->pending && !depth_framebuffer->error) || !state->depth.pixels) result = -1;
+            else {
+                memcpy(depth_framebuffer->pixels, state->depth.pixels, depth_framebuffer->size);
+                depth_framebuffer->cpu_revision = state->depth.cpu_revision;
+                depth_framebuffer->valid = 1;
+                depth_framebuffer->pending = depth_framebuffer->error = depth_framebuffer->unpublished = 0;
+                depth_framebuffer->pending_top = depth_framebuffer->pending_bottom = 0;
+                depth_framebuffer->unpublished_top = depth_framebuffer->unpublished_bottom = 0;
+                reseed = 1;
+            }
+        }
+        if (!result) result = framebuffer_resource_reserve_unlocked(depth_framebuffer);
+        struct resource *depth = result ? NULL : res_slot(depth_framebuffer->resource_id);
+        if (!result && !depth) result = -1;
+        if (!result && (reseed || !depth->host_live || (!depth_framebuffer->pending && !depth->host_current)))
+            result = replace_bytes(depth_framebuffer->resource_id, depth_framebuffer->pixels, depth_framebuffer->size,
+                                   depth_framebuffer->width, depth_framebuffer->height);
+        if (!result) result = create_texture_resource(depth_framebuffer->resource_id,
+            MXGPU_USAGE_DEPTH_STENCIL | MXGPU_USAGE_TRANSFER_SOURCE | MXGPU_USAGE_TRANSFER_DESTINATION);
+        if (!result && !depth_framebuffer->pending) result = transfer_bytes(depth_framebuffer->resource_id);
+    }
     struct resource *framebuffer_resource = framebuffer ? res_slot(framebuffer->resource_id) : NULL;
     int framebuffer_needs_seed = framebuffer && (!framebuffer->resource_id || framebuffer->resource_blocked ||
         !framebuffer->valid || framebuffer->cpu_revision != cpu_revision || !framebuffer_resource ||
@@ -3756,7 +3865,7 @@ static int execute_module_transaction_resources(int fd, const uint8_t *module, u
             result = mxgpu_seed_color_unlocked(framebuffer ? framebuffer->pixels : initial_color, cw, ch);
         if (!result && framebuffer) g_dev.framebuffer = framebuffer;
     }
-    if (!result && state && state->depth_enabled) {
+    if (!result && state && state->depth_enabled && !depth_framebuffer) {
         unsigned pixel_bytes = state->depth.format == MXGPU_FMT_DEPTH32_FLOAT_STENCIL8 ? 8 : 4;
         unsigned bytes = state->depth.width * state->depth.height * pixel_bytes;
         if (!g_dev.depth_id) g_dev.depth_id = new_resource(MXGPU_KIND_TEXTURE_2D,
@@ -3785,7 +3894,11 @@ static int execute_module_transaction_resources(int fd, const uint8_t *module, u
                                                        vertex_uniforms, vertex_uniform_size,
                                                        fragment_uniforms, fragment_uniform_size, vertex_stride_bytes);
     }
-    if (!result && state && state->depth_enabled) {
+    if (!result && depth_framebuffer && !framebuffer) {
+        struct resource *color_resource = res_slot(g_dev.color_id);
+        memcpy(color, color_resource->bytes, color_resource->size);
+    }
+    if (!result && state && state->depth_enabled && !depth_framebuffer) {
         struct resource *depth = res_slot(g_dev.depth_id);
         operation = "depth-readback";
         result = readback_attachment(depth);
@@ -3796,7 +3909,7 @@ static int execute_module_transaction_resources(int fd, const uint8_t *module, u
             memcpy(color, color_resource->bytes, color_resource->size);
         }
     }
-    if (result && state && state->depth_enabled) {
+    if (result && state && state->depth_enabled && !depth_framebuffer) {
         struct resource *depth = res_slot(g_dev.depth_id);
         struct resource *color_resource = res_slot(g_dev.color_id);
         if (depth) depth->host_current = 0;
@@ -3820,12 +3933,28 @@ static int execute_module_transaction_resources(int fd, const uint8_t *module, u
         framebuffer_rows_add(&framebuffer->pending_top, &framebuffer->pending_bottom, first, end);
         framebuffer->pending = framebuffer->unpublished = 1;
     }
+    if (!result && depth_framebuffer && mxgpu_depth_stencil_writes(&state->depth_stencil)) {
+        uint32_t first = 0, end = depth_framebuffer->height;
+        if (state->rasterizer.scissor_enable) {
+            first = state->scissor.top < end ? state->scissor.top : end;
+            end = state->scissor.bottom < end ? state->scissor.bottom : end;
+        }
+        if (state->bounds_valid) {
+            if (state->bounds.top > first) first = state->bounds.top < end ? state->bounds.top : end;
+            if (state->bounds.bottom < end) end = state->bounds.bottom > first ? state->bounds.bottom : first;
+        }
+        framebuffer_rows_add(&depth_framebuffer->pending_top, &depth_framebuffer->pending_bottom, first, end);
+        depth_framebuffer->pending = depth_framebuffer->unpublished = 1;
+    }
+    if (result && depth_framebuffer && depth_framebuffer->pending)
+        framebuffer_rows_add(&depth_framebuffer->pending_top, &depth_framebuffer->pending_bottom, 0, depth_framebuffer->height);
     if (result && framebuffer && framebuffer->pending)
         framebuffer_rows_add(&framebuffer->pending_top, &framebuffer->pending_bottom, 0, framebuffer->height);
     if (!result && readback_complete)
         *readback_complete = framebuffer == NULL;
     g_dev.batch_collect = 0;
     if (result && g_dev.batch.count) batch_drain_unlocked();
+    g_dev.depth_framebuffer = NULL;
     g_dev.deferred_readback = 0;
     g_dev.native_active = 0;
     g_dev.draw_textures = NULL;

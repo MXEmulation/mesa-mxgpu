@@ -73,10 +73,26 @@ struct mxgpu_texture_input {
     struct mxgpu_framebuffer *framebuffer;
     uint64_t framebuffer_revision;
 };
+struct mxgpu_framebuffer;
 struct mxgpu_depth_input {
     unsigned char *pixels;
     uint32_t format, width, height;
+    struct mxgpu_framebuffer *framebuffer;
+    uint64_t cpu_revision;
 };
+static inline int mxgpu_depth_stencil_writes(const struct mxgpu_depth_stencil_state *state)
+{
+    const struct mxgpu_stencil_face *faces[2] = {&state->front, &state->back};
+    if (state->depth_write_enable)
+        return 1;
+    if (!state->stencil_enable || !state->stencil_write_mask)
+        return 0;
+    for (unsigned i = 0; i < 2; i++)
+        if (faces[i]->fail != MXGPU_STENCIL_KEEP || faces[i]->depth_fail != MXGPU_STENCIL_KEEP ||
+            faces[i]->pass != MXGPU_STENCIL_KEEP)
+            return 1;
+    return 0;
+}
 struct mxgpu_native_render_state {
     struct mxgpu_blend_state blend;
     struct mxgpu_rasterizer_state rasterizer;
@@ -94,6 +110,8 @@ struct mxgpu_native_render_state {
 };
 struct mxgpu_framebuffer;
 struct mxgpu_framebuffer *mxgpu_framebuffer_create(uint32_t width, uint32_t height);
+struct mxgpu_framebuffer *mxgpu_depth_framebuffer_create(uint32_t width, uint32_t height, uint32_t format);
+int mxgpu_framebuffer_current(struct mxgpu_framebuffer *framebuffer, uint64_t cpu_revision);
 int mxgpu_framebuffer_destroy(struct mxgpu_framebuffer *framebuffer);
 int mxgpu_framebuffer_discard(struct mxgpu_framebuffer *framebuffer);
 int mxgpu_framebuffer_clear(struct mxgpu_framebuffer *framebuffer, const unsigned char rgba[4], uint64_t cpu_revision);

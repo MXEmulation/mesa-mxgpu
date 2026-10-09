@@ -2001,11 +2001,38 @@ static bool write_color_rows(struct pipe_surface *surf, const unsigned char *rgb
     return resource_cpu_sync(res, PIPE_MAP_WRITE, true);
 }
 
+static unsigned native_depth_format(enum pipe_format format);
+static void depth_row_from_wire(unsigned char *destination, const unsigned char *source, unsigned width, unsigned format);
+
+static bool depth_publish(struct mxgpu_resource *res)
+{
+    int changed;
+    bool success;
+    if (!res->framebuffer_dirty)
+        return true;
+    if (!color_rows_fit(res, 0, res->base.width0, res->base.height0, util_format_get_blocksize(res->base.format)))
+        return false;
+    res->framebuffer_publishing = true;
+    success = resource_cpu_sync(res, PIPE_MAP_WRITE, false);
+    if (success) {
+        success = !mxgpu_framebuffer_sync(res->framebuffer, res->data + res->level_offset[0],
+                                          res->level_stride[0], depth_row_from_wire, res->base.format,
+                                          false, &changed);
+        success = resource_cpu_sync(res, PIPE_MAP_WRITE, true) && success;
+    }
+    res->framebuffer_publishing = false;
+    if (success)
+        res->framebuffer_dirty = false;
+    return success;
+}
+
 static bool resource_publish(struct mxgpu_resource *res)
 {
     int changed;
     bool success;
     unsigned fast = color_row_fast_format(res->base.format);
+    if (res->framebuffer && native_depth_format(res->base.format))
+        return depth_publish(res);
     if (res->clear_pending)
         return resource_clear_materialise(res);
     if (!res->framebuffer_dirty)
@@ -2048,6 +2075,67 @@ static unsigned native_depth_block(unsigned format)
     return format == MXGPU_FMT_DEPTH32_FLOAT_STENCIL8 ? 8u : 4u;
 }
 
+static void depth_row_from_wire(unsigned char *destination, const unsigned char *source, unsigned width, unsigned format)
+{
+    unsigned block = util_format_get_blocksize(format);
+    unsigned wire_block = native_depth_block(native_depth_format(format));
+    if (format == PIPE_FORMAT_Z16_UNORM) {
+        for (unsigned x = 0; x < width; x++) {
+            float depth;
+            uint16_t z;
+            memcpy(&depth, source + (size_t)x * wire_block, sizeof depth);
+            z = !(depth > 0.f) ? 0 : depth >= 1.f ? UINT16_MAX : (uint16_t)((double)depth * UINT16_MAX + 0.5);
+            memcpy(destination + (size_t)x * block, &z, sizeof z);
+        }
+    } else if (format == PIPE_FORMAT_S8_UINT_Z24_UNORM) {
+        for (unsigned x = 0; x < width; x++) {
+            uint32_t value;
+            memcpy(&value, source + (size_t)x * wire_block, sizeof value);
+            value = (value << 8) | (value >> 24);
+            memcpy(destination + (size_t)x * block, &value, sizeof value);
+        }
+    } else if (format == PIPE_FORMAT_Z24X8_UNORM) {
+        for (unsigned x = 0; x < width; x++)
+            memcpy(destination + (size_t)x * block, source + (size_t)x * block, 3);
+    } else if (format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT) {
+        for (unsigned x = 0; x < width; x++)
+            memcpy(destination + (size_t)x * block, source + (size_t)x * block, 5);
+    } else
+        memcpy(destination, source, (size_t)width * block);
+}
+
+static void depth_row_to_wire(unsigned char *destination, const unsigned char *source, unsigned width, unsigned format)
+{
+    unsigned block = util_format_get_blocksize(format);
+    unsigned wire_block = native_depth_block(native_depth_format(format));
+    if (format == PIPE_FORMAT_Z16_UNORM) {
+        for (unsigned x = 0; x < width; x++) {
+            uint16_t z;
+            float depth;
+            memcpy(&z, source + (size_t)x * block, sizeof z);
+            depth = (float)z / (float)UINT16_MAX;
+            memcpy(destination + (size_t)x * wire_block, &depth, sizeof depth);
+        }
+        return;
+    }
+    if (format == PIPE_FORMAT_S8_UINT_Z24_UNORM) {
+        for (unsigned x = 0; x < width; x++) {
+            uint32_t value;
+            memcpy(&value, source + (size_t)x * block, sizeof value);
+            value = (value >> 8) | (value << 24);
+            memcpy(destination + (size_t)x * wire_block, &value, sizeof value);
+        }
+        return;
+    }
+    memcpy(destination, source, (size_t)width * block);
+    if (format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT)
+        for (unsigned x = 0; x < width; x++)
+            memset(destination + (size_t)x * block + 5, 0, 3);
+    if (format == PIPE_FORMAT_Z24X8_UNORM)
+        for (unsigned x = 0; x < width; x++)
+            destination[(size_t)x * block + 3] = 0;
+}
+
 static bool depth_rows_copy(struct pipe_surface *surf, unsigned char *pixels,
                             unsigned width, unsigned height, bool write)
 {
@@ -2078,50 +2166,10 @@ static bool depth_rows_copy(struct pipe_surface *surf, unsigned char *pixels,
         unsigned char *resource_row = res->data + res->level_offset[surf->level] +
                                       (size_t)y * res->level_stride[surf->level];
         unsigned char *packed_row = pixels + (size_t)y * width * wire_block;
-        if (surf->format == PIPE_FORMAT_Z16_UNORM) {
-            for (unsigned x = 0; x < width; x++) {
-                uint16_t z;
-                float depth;
-                if (write) {
-                    memcpy(&depth, packed_row + (size_t)x * wire_block, sizeof depth);
-                    z = depth <= 0.f ? 0 : depth >= 1.f ? UINT16_MAX :
-                        (uint16_t)((double)depth * UINT16_MAX + 0.5);
-                    memcpy(resource_row + (size_t)x * block, &z, sizeof z);
-                } else {
-                    memcpy(&z, resource_row + (size_t)x * block, sizeof z);
-                    depth = (float)z / (float)UINT16_MAX;
-                    memcpy(packed_row + (size_t)x * wire_block, &depth, sizeof depth);
-                }
-            }
-        } else if (surf->format == PIPE_FORMAT_S8_UINT_Z24_UNORM) {
-            for (unsigned x = 0; x < width; x++) {
-                uint32_t value;
-                if (write) {
-                    memcpy(&value, packed_row + (size_t)x * wire_block, sizeof value);
-                    value = (value << 8) | (value >> 24);
-                    memcpy(resource_row + (size_t)x * block, &value, sizeof value);
-                } else {
-                    memcpy(&value, resource_row + (size_t)x * block, sizeof value);
-                    value = (value >> 8) | (value << 24);
-                    memcpy(packed_row + (size_t)x * wire_block, &value, sizeof value);
-                }
-            }
-        } else if (write && surf->format == PIPE_FORMAT_Z24X8_UNORM) {
-            for (unsigned x = 0; x < width; x++)
-                memcpy(resource_row + (size_t)x * block, packed_row + (size_t)x * block, 3);
-        } else if (write && surf->format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT) {
-            for (unsigned x = 0; x < width; x++)
-                memcpy(resource_row + (size_t)x * block, packed_row + (size_t)x * block, 5);
-        } else if (write)
-            memcpy(resource_row, packed_row, (size_t)width * block);
+        if (write)
+            depth_row_from_wire(resource_row, packed_row, width, surf->format);
         else
-            memcpy(packed_row, resource_row, (size_t)width * block);
-        if (surf->format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT && !write)
-            for (unsigned x = 0; x < width; x++)
-                memset(packed_row + (size_t)x * block + 5, 0, 3);
-        if (surf->format == PIPE_FORMAT_Z24X8_UNORM && !write)
-            for (unsigned x = 0; x < width; x++)
-                packed_row[(size_t)x * block + 3] = 0;
+            depth_row_to_wire(packed_row, resource_row, width, surf->format);
     }
     return resource_cpu_sync(res, flags, true);
 }
@@ -2466,6 +2514,14 @@ static void resource_nop(struct pipe_context *pipe, struct pipe_resource *resour
         res_of(resource)->cpu_revision++;
 }
 
+static void invalidate_resource(struct pipe_context *pipe, struct pipe_resource *resource)
+{
+    struct mxgpu_resource *res = resource ? res_of(resource) : NULL;
+    if (res && res->framebuffer && !res->external && !res->imported)
+        return;
+    resource_nop(pipe, resource);
+}
+
 static void sample_pos(struct pipe_context *pipe, unsigned count, unsigned index, float *out)
 {
     (void)pipe;
@@ -2673,6 +2729,7 @@ static void mxgpu_draw(struct pipe_context *pipe, const struct pipe_draw_info *i
     bool native = false;
     bool deferred = false;
     struct mxgpu_resource *target = NULL;
+    struct mxgpu_resource *depth_target = NULL;
     struct mxgpu_native_render_state native_state;
     const void *vs_constants, *fs_constants;
     uint32_t vs_constant_size, fs_constant_size;
@@ -2731,11 +2788,26 @@ static void mxgpu_draw(struct pipe_context *pipe, const struct pipe_draw_info *i
         if (!native || !format || !mxgpu_native_depth_available(screen_of(pipe->screen)->fd, format) ||
             !native_depth_stencil_state(ctx, &native_state.depth_stencil, &native_state.stencil_reference))
             return;
-        depth_pixels = malloc((size_t)cw * ch * block);
-        if (!depth_pixels)
-            return;
-        if (!depth_rows_copy(&ctx->fb.zsbuf, depth_pixels, cw, ch, false))
-            goto free_textures;
+        struct pipe_resource *zs = ctx->fb.zsbuf.texture;
+        if (zs->target == PIPE_TEXTURE_2D && zs->array_size <= 1 && !ctx->fb.zsbuf.level &&
+            !ctx->fb.zsbuf.first_layer && !ctx->fb.zsbuf.last_layer && ctx->fb.zsbuf.format == zs->format &&
+            cw == zs->width0 && ch == zs->height0 && !res_of(zs)->imported && !res_of(zs)->external &&
+            color_rows_fit(res_of(zs), 0, cw, ch, util_format_get_blocksize(zs->format))) {
+            depth_target = res_of(zs);
+            if (!depth_target->framebuffer)
+                depth_target->framebuffer = mxgpu_depth_framebuffer_create(cw, ch, format);
+            if (!depth_target->framebuffer)
+                depth_target = NULL;
+        }
+        if (!depth_target || !mxgpu_framebuffer_current(depth_target->framebuffer, depth_target->cpu_revision)) {
+            depth_pixels = malloc((size_t)cw * ch * block);
+            if (!depth_pixels)
+                return;
+            if (!depth_rows_copy(&ctx->fb.zsbuf, depth_pixels, cw, ch, false))
+                goto free_textures;
+        }
+        native_state.depth.framebuffer = depth_target ? depth_target->framebuffer : NULL;
+        native_state.depth.cpu_revision = depth_target ? depth_target->cpu_revision : 0;
         native_state.depth_enabled = 1;
         native_state.depth.pixels = depth_pixels;
         native_state.depth.format = format;
@@ -2809,7 +2881,7 @@ static void mxgpu_draw(struct pipe_context *pipe, const struct pipe_draw_info *i
             goto free_textures;
         memset(texels, 255, 4);
     }
-    if (native && has_color && !native_state.depth_enabled &&
+    if (native && has_color && (!native_state.depth_enabled || depth_target) &&
         !ctx->fb.cbufs[0].level && !ctx->fb.cbufs[0].first_layer &&
         !ctx->fb.cbufs[0].last_layer &&
         ctx->fb.cbufs[0].format == ctx->fb.cbufs[0].texture->format &&
@@ -2956,7 +3028,10 @@ static void mxgpu_draw(struct pipe_context *pipe, const struct pipe_draw_info *i
             if (updated) {
                 if (has_color && !deferred)
                     write_color_rows(&ctx->fb.cbufs[0], pixels, cw, ch, !native);
-                if (depth_pixels && !depth_rows_copy(&ctx->fb.zsbuf, depth_pixels, cw, ch, true)) {
+                if (depth_target) {
+                    if (mxgpu_depth_stencil_writes(&native_state.depth_stencil))
+                        depth_target->framebuffer_dirty = true;
+                } else if (depth_pixels && !depth_rows_copy(&ctx->fb.zsbuf, depth_pixels, cw, ch, true)) {
                     free(verts);
                     break;
                 }
@@ -3192,7 +3267,7 @@ static struct pipe_context *mxgpu_context_create(struct pipe_screen *screen, voi
     ctx->base.texture_barrier = barrier_nop;
     ctx->base.memory_barrier = barrier_nop;
     ctx->base.flush_resource = resource_nop;
-    ctx->base.invalidate_resource = resource_nop;
+    ctx->base.invalidate_resource = invalidate_resource;
     ctx->base.resource_release = u_default_resource_release;
     ctx->base.get_sample_position = sample_pos;
     ctx->base.get_device_reset_status = reset_status;
