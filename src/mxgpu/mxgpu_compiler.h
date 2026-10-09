@@ -21,7 +21,7 @@ struct mxgpu_texture_binding {
     bool separate_sampler;
     unsigned sampler_set, sampler_binding, sampler_element;
 };
-#define MXGPU_SHADER_TEXTURES 8u
+#define MXGPU_SHADER_TEXTURES 16u
 #define MXGPU_SHADER_COLOR_OUTPUTS 8u
 #define MXGPU_LINK_COVERAGE_OUTPUT MXGPU_SHADER_COLOR_OUTPUTS
 #define MXGPU_SHADER_SIZE_QUERIES 32u

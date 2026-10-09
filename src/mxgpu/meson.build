@@ -42,6 +42,7 @@ if get_option('mxgpu-tests')
     executable('egl_client', 'egl_client.c', c_args : '-DMXGPU_EGL_CLIENT_MAIN',
                dependencies : mxgpu_egl_deps)
     executable('egl_instancing', 'egl_instancing.c', dependencies : mxgpu_egl_deps)
+    executable('gl_textures', 'gl_textures.c', dependencies : mxgpu_egl_deps)
   endif
   if with_mxgpu_vk
     glslang = find_program('glslangValidator', required : true)
@@ -100,6 +101,21 @@ if get_option('mxgpu-tests')
       )
     endforeach
     executable('vk_features', files('vk_features.c') + features_shaders,
+               dependencies : [vulkan_loader, cc.find_library('m', required : false)])
+    webgpu_shaders = [features_shaders[0]]
+    foreach shader : [
+      ['webgpu-sixteen.frag', 'webgpu-sixteen-frag.h', 'webgpu_sixteen'],
+      ['webgpu-gradient.frag', 'webgpu-gradient-frag.h', 'webgpu_gradient'],
+      ['webgpu-probe.frag', 'webgpu-probe-frag.h', 'webgpu_probe'],
+      ['webgpu-float.frag', 'webgpu-float-frag.h', 'webgpu_float'],
+      ['webgpu-unorm.frag', 'webgpu-unorm-frag.h', 'webgpu_unorm'],
+    ]
+      webgpu_shaders += custom_target(
+        shader[1], input : shader[0], output : shader[1],
+        command : [glslang, '-V', '--target-env', 'vulkan1.1', '--vn', shader[2], '-o', '@OUTPUT@', '@INPUT@'],
+      )
+    endforeach
+    executable('vk_webgpu', files('vk_webgpu.c') + webgpu_shaders,
                dependencies : [vulkan_loader, cc.find_library('m', required : false)])
   endif
 endif

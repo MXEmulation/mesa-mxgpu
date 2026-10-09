@@ -20,12 +20,12 @@
 
 #define MX_EXPORT __attribute__((visibility("default")))
 #define MXGPU_VK_PUSH_CONSTANT_BYTES 128u
-#define MXGPU_VK_HEAP_BYTES (64ull << 20)
+#define MXGPU_VK_FALLBACK_HEAP_BYTES (64ull << 20)
 #define MXGPU_VK_STAGES 3u
 #define MXGPU_VK_COMPUTE_STAGE 2u
 #define MXGPU_VK_STORAGE_OFFSET_ALIGNMENT 16u
 #define MXGPU_VK_API_VERSION VK_API_VERSION_1_1
-#define MXGPU_VK_MAX_IMAGE_DIMENSION 2048u
+#define MXGPU_VK_FALLBACK_IMAGE_DIMENSION 2048u
 #define MXGPU_VK_UNIFORM_BUFFER_RANGE 65536u
 #define MXGPU_VK_STAGE_UNIFORM_BUFFERS (MXGPU_UNIFORM_BUFFERS - 1u)
 #define MXGPU_VK_INTERSTAGE_COMPONENTS 128u
@@ -537,6 +537,26 @@ static bool vk_compute_supported(void)
     return mxgpu_device_open() == 0 && mxgpu_compute_available();
 }
 
+static uint32_t vk_max_image_dimension(void)
+{
+    struct mxgpu_adapter_info info;
+    return mxgpu_adapter_limits(-1, &info) ? info.max_texture_dimension_2d : MXGPU_VK_FALLBACK_IMAGE_DIMENSION;
+}
+
+static VkDeviceSize vk_heap_bytes(void)
+{
+    struct mxgpu_adapter_info info;
+    return mxgpu_adapter_limits(-1, &info) && info.max_buffer_bytes > MXGPU_VK_FALLBACK_HEAP_BYTES ?
+           info.max_buffer_bytes : MXGPU_VK_FALLBACK_HEAP_BYTES;
+}
+
+static uint32_t vk_mip_levels(uint32_t dimension)
+{
+    uint32_t levels = 0;
+    while (dimension) { levels++; dimension >>= 1; }
+    return levels;
+}
+
 static uint32_t vk_stage_textures(void)
 {
     uint32_t textures = MXGPU_SHADER_TEXTURES < MXGPU_TEXTURE_INPUTS ? MXGPU_SHADER_TEXTURES : MXGPU_TEXTURE_INPUTS;
@@ -547,6 +567,8 @@ static void device_props(VkPhysicalDevice gpu, VkPhysicalDeviceProperties *props
 {
     VkPhysicalDeviceLimits *limits = &props->limits;
     uint32_t textures = vk_stage_textures();
+    uint32_t dimension = vk_max_image_dimension();
+    VkDeviceSize heap = vk_heap_bytes();
     bool compute = vk_compute_supported();
     (void)gpu;
     memset(props, 0, sizeof *props);
@@ -558,7 +580,7 @@ static void device_props(VkPhysicalDevice gpu, VkPhysicalDeviceProperties *props
     memcpy(props->pipelineCacheUUID, mx_pipeline_cache_uuid, VK_UUID_SIZE);
     props->deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
     memcpy(props->deviceName, "MXGPU", 6);
-    limits->maxImageDimension2D = MXGPU_VK_MAX_IMAGE_DIMENSION;
+    limits->maxImageDimension2D = dimension;
     limits->maxImageArrayLayers = 1;
     limits->maxUniformBufferRange = MXGPU_VK_UNIFORM_BUFFER_RANGE;
     limits->maxPushConstantsSize = MXGPU_VK_PUSH_CONSTANT_BYTES;
@@ -592,15 +614,15 @@ static void device_props(VkPhysicalDevice gpu, VkPhysicalDeviceProperties *props
     limits->maxSamplerLodBias = 2.0f;
     limits->maxSamplerAnisotropy = 1.0f;
     limits->maxViewports = 1;
-    limits->maxViewportDimensions[0] = limits->maxViewportDimensions[1] = MXGPU_VK_MAX_IMAGE_DIMENSION;
-    limits->viewportBoundsRange[0] = -2.0f * MXGPU_VK_MAX_IMAGE_DIMENSION;
-    limits->viewportBoundsRange[1] = 2.0f * MXGPU_VK_MAX_IMAGE_DIMENSION - 1.0f;
+    limits->maxViewportDimensions[0] = limits->maxViewportDimensions[1] = dimension;
+    limits->viewportBoundsRange[0] = -2.0f * dimension;
+    limits->viewportBoundsRange[1] = 2.0f * dimension - 1.0f;
     limits->minMemoryMapAlignment = MXGPU_VK_MAP_ALIGNMENT;
     limits->minTexelBufferOffsetAlignment = 256;
     limits->minUniformBufferOffsetAlignment = MXGPU_VK_STORAGE_OFFSET_ALIGNMENT;
     limits->minStorageBufferOffsetAlignment = MXGPU_VK_STORAGE_OFFSET_ALIGNMENT;
-    limits->maxFramebufferWidth = MXGPU_VK_MAX_IMAGE_DIMENSION;
-    limits->maxFramebufferHeight = MXGPU_VK_MAX_IMAGE_DIMENSION;
+    limits->maxFramebufferWidth = dimension;
+    limits->maxFramebufferHeight = dimension;
     limits->maxFramebufferLayers = 1;
     limits->framebufferColorSampleCounts = VK_SAMPLE_COUNT_1_BIT;
     limits->framebufferDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT;
@@ -623,11 +645,13 @@ static void device_props(VkPhysicalDevice gpu, VkPhysicalDeviceProperties *props
         limits->maxComputeWorkGroupCount[0] = 65535;
         limits->maxComputeWorkGroupCount[1] = 65535;
         limits->maxComputeWorkGroupCount[2] = 65535;
-        limits->maxComputeWorkGroupInvocations = 128;
-        limits->maxComputeWorkGroupSize[0] = 128;
-        limits->maxComputeWorkGroupSize[1] = 128;
-        limits->maxComputeWorkGroupSize[2] = 64;
-        limits->maxStorageBufferRange = (uint32_t)MXGPU_VK_HEAP_BYTES;
+        struct mxgpu_drm_compute_limits host;
+        bool negotiated = mxgpu_compute_limits(&host);
+        limits->maxComputeWorkGroupInvocations = negotiated ? host.max_work_group_invocations : 128;
+        limits->maxComputeWorkGroupSize[0] = negotiated ? host.max_work_group_size[0] : 128;
+        limits->maxComputeWorkGroupSize[1] = negotiated ? host.max_work_group_size[1] : 128;
+        limits->maxComputeWorkGroupSize[2] = negotiated ? host.max_work_group_size[2] : 64;
+        limits->maxStorageBufferRange = heap > UINT32_MAX ? UINT32_MAX : (uint32_t)heap;
         limits->maxPerStageDescriptorStorageBuffers = MXGPU_SHADER_STORAGE_BUFFERS;
         limits->maxDescriptorSetStorageBuffers = MXGPU_SHADER_STORAGE_BUFFERS;
         limits->maxDescriptorSetStorageBuffersDynamic = MXGPU_SHADER_STORAGE_BUFFERS;
@@ -823,22 +847,60 @@ static enum pipe_format vk_color_format(VkFormat format)
     case VK_FORMAT_R8G8B8_UNORM:
     case VK_FORMAT_B8G8R8_UNORM:
     case VK_FORMAT_R8G8B8A8_UNORM:
-    case VK_FORMAT_B8G8R8A8_UNORM: return vk_format_to_pipe_format(format);
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_B8G8R8A8_SRGB:
+    case VK_FORMAT_R8G8B8A8_SNORM:
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+    case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
+    case VK_FORMAT_R16_SFLOAT:
+    case VK_FORMAT_R16G16_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R32_SFLOAT:
+    case VK_FORMAT_R32G32_SFLOAT:
+    case VK_FORMAT_R32G32B32A32_SFLOAT: return vk_format_to_pipe_format(format);
     default: return PIPE_FORMAT_NONE;
+    }
+}
+
+static uint32_t vk_host_color_format(VkFormat format)
+{
+    switch (format) {
+    case VK_FORMAT_R8G8B8A8_SRGB: return MXGPU_FMT_RGBA8_UNORM_SRGB;
+    case VK_FORMAT_B8G8R8A8_SRGB: return MXGPU_FMT_BGRA8_UNORM_SRGB;
+    case VK_FORMAT_R8G8B8A8_SNORM: return MXGPU_FMT_RGBA8_SNORM;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return MXGPU_FMT_RGB10A2_UNORM;
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32: return MXGPU_FMT_R11G11B10_FLOAT;
+    case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: return MXGPU_FMT_R9G9B9E5_FLOAT;
+    case VK_FORMAT_R16_SFLOAT: return MXGPU_FMT_R16_FLOAT;
+    case VK_FORMAT_R16G16_SFLOAT: return MXGPU_FMT_RG16_FLOAT;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: return MXGPU_FMT_RGBA16_FLOAT;
+    case VK_FORMAT_R32_SFLOAT: return MXGPU_FMT_R32_FLOAT;
+    case VK_FORMAT_R32G32_SFLOAT: return MXGPU_FMT_RG32_FLOAT;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: return MXGPU_FMT_RGBA32_FLOAT;
+    default: return 0;
     }
 }
 
 static uint8_t vk_color_write_mask(VkFormat format)
 {
-    switch (format) {
-    case VK_FORMAT_R8_UNORM: return 1;
-    case VK_FORMAT_R8G8_UNORM: return 3;
-    case VK_FORMAT_R8G8B8_UNORM:
-    case VK_FORMAT_B8G8R8_UNORM: return 7;
-    case VK_FORMAT_R8G8B8A8_UNORM:
-    case VK_FORMAT_B8G8R8A8_UNORM: return 15;
-    default: return 0;
-    }
+    enum pipe_format color = vk_color_format(format);
+    unsigned channels = color != PIPE_FORMAT_NONE ? util_format_get_nr_components(color) : 0;
+    return channels ? (uint8_t)((1u << channels) - 1u) : 0;
+}
+
+static bool vk_color_attachment_supported(VkFormat format)
+{
+    uint32_t host = vk_host_color_format(format);
+    return vk_color_format(format) != PIPE_FORMAT_NONE &&
+           (!host || mxgpu_color_target_format_supported(-1, host));
+}
+
+static bool vk_sampled_supported(VkFormat format)
+{
+    uint32_t host = vk_host_color_format(format);
+    return vk_color_format(format) != PIPE_FORMAT_NONE && (!host || mxgpu_sampled_format_supported(-1, host));
 }
 
 static unsigned vk_format_bytes(VkFormat format)
@@ -3532,7 +3594,7 @@ done:
 }
 
 static VkResult stage_view_texture(const struct mx_view *view, const uint8_t *source,
-                                   VkDeviceSize size, const uint8_t **data, uint8_t **storage)
+                                   VkDeviceSize size, const uint8_t **data, uint8_t **storage, uint32_t *host_format)
 {
     VkComponentSwizzle components[4] = {view->components.r, view->components.g,
                                         view->components.b, view->components.a};
@@ -3556,6 +3618,31 @@ static VkResult stage_view_texture(const struct mx_view *view, const uint8_t *so
     }
     if (identity && view->format == VK_FORMAT_R8G8B8A8_UNORM)
         return VK_SUCCESS;
+    uint32_t native = host_format ? vk_host_color_format(view->format) : 0;
+    if (native && !mxgpu_sampled_format_supported(-1, native))
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    if (native && identity) {
+        *host_format = native;
+        return VK_SUCCESS;
+    }
+    if (native) {
+        size_t pixels = (size_t)(size / bpp);
+        if (!mxgpu_sampled_format_supported(-1, MXGPU_FMT_RGBA32_FLOAT) || pixels > SIZE_MAX / 16u)
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        float *expanded = malloc(pixels * 16u);
+        if (!expanded)
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        for (size_t pixel = 0; pixel < pixels; pixel++) {
+            float rgba[4];
+            util_format_unpack_rgba(format, rgba, source + pixel * bpp, 1);
+            for (unsigned c = 0; c < 4; c++)
+                expanded[pixel * 4u + c] = channels[c] < 4 ? rgba[channels[c]] : channels[c] == 4 ? 0.0f : 1.0f;
+        }
+        *storage = (uint8_t *)expanded;
+        *data = *storage;
+        *host_format = MXGPU_FMT_RGBA32_FLOAT;
+        return VK_SUCCESS;
+    }
     *storage = malloc((size_t)(size / bpp) * 4u);
     if (!*storage)
         return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -3697,7 +3784,7 @@ static VkResult vk_collect_texture_inputs(struct mx_cmd *cmd,
         inputs[i].texture_slot = binding->texture_slot;
         inputs[i].sampler_slot = binding->sampler_slot;
         VkResult result = stage_view_texture(view, (const uint8_t *)image->mem->ptr + offset,
-                                             bytes, &inputs[i].pixels, &storage[i]);
+                                             bytes, &inputs[i].pixels, &storage[i], &inputs[i].format);
         if (result != VK_SUCCESS) {
             vk_free_texture_inputs(storage);
             memset(storage, 0, sizeof(uint8_t *) * MXGPU_TEXTURE_INPUTS);
@@ -3735,7 +3822,7 @@ static VkResult vk_stage_attachment(struct mx_view *view, uint32_t width, uint32
     if (result != VK_SUCCESS)
         return result;
     unsigned bpp = vk_format_bytes(view->format);
-    enum pipe_format color_format = vk_color_format(view->format);
+    enum pipe_format color_format = vk_host_color_format(view->format) ? PIPE_FORMAT_NONE : vk_color_format(view->format);
     unsigned staged_bpp = color_format != PIPE_FORMAT_NONE ? 4 : bpp;
     if (!width || !height || width > view->width || height > view->height ||
         (VkDeviceSize)width * height > SIZE_MAX / staged_bpp)
@@ -3759,7 +3846,7 @@ static void vk_commit_attachment(struct mx_view *view, uint32_t width, uint32_t 
     if (vk_view_backing(view, &destination) != VK_SUCCESS)
         return;
     unsigned bpp = vk_format_bytes(view->format);
-    enum pipe_format color_format = vk_color_format(view->format);
+    enum pipe_format color_format = vk_host_color_format(view->format) ? PIPE_FORMAT_NONE : vk_color_format(view->format);
     for (uint32_t y = 0; y < height; y++) {
         if (color_format != PIPE_FORMAT_NONE)
             util_format_pack_description(color_format)->pack_rgba_8unorm(
@@ -4109,7 +4196,8 @@ static VkResult perform_draw(struct mx_cmd *cmd)
     if (result == VK_SUCCESS)
         result = collect_uniforms(cmd, 1, &uniform_data[1], &uniform_size[1]);
     if (result == VK_SUCCESS)
-        result = stage_view_texture(tv, (const uint8_t *)tex->mem->ptr + tex_offset, texture_bytes, &texels, &mapped_texels);
+        result = stage_view_texture(tv, (const uint8_t *)tex->mem->ptr + tex_offset, texture_bytes, &texels, &mapped_texels,
+                                    NULL);
     if (result != VK_SUCCESS)
         goto done;
     bool native = mxgpu_native_render_available(-1);
@@ -4159,10 +4247,11 @@ static VkResult perform_draw(struct mx_cmd *cmd)
         } else if (colour) {
             state.blend.targets[0] = cmd->pipe->blend_targets[attachment];
             state.blend.targets[0].write_mask &= vk_color_write_mask(cmd->colors[attachment]->format);
+            state.color_format = vk_host_color_format(cmd->colors[attachment]->format);
         } else {
             state.blend.targets[0].write_mask = 0;
         }
-        if (!native && vk_native_state_required(&state, render_width, render_height)) {
+        if (!native && (state.color_format || vk_native_state_required(&state, render_width, render_height))) {
             result = VK_ERROR_FEATURE_NOT_PRESENT;
             goto done;
         }
@@ -6003,7 +6092,7 @@ static void mem_props(VkPhysicalDevice gpu, VkPhysicalDeviceMemoryProperties *pr
     props->memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     props->memoryHeapCount = 1;
-    props->memoryHeaps[0].size = MXGPU_VK_HEAP_BYTES;
+    props->memoryHeaps[0].size = vk_heap_bytes();
     props->memoryHeaps[0].flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
 }
 
@@ -6180,13 +6269,22 @@ static void format_properties(VkPhysicalDevice physical, VkFormat format, VkForm
     (void)physical;
     memset(properties, 0, sizeof *properties);
     if (vk_color_format(format) != PIPE_FORMAT_NONE) {
-        properties->linearTilingFeatures = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
-            VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
-            VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+        uint32_t host = vk_host_color_format(format);
+        struct mxgpu_format_capabilities caps;
+        bool known = host && mxgpu_format_caps(-1, &caps);
+        uint32_t bit = host ? 1u << (host - 1u) : 0;
+        properties->linearTilingFeatures = VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
             VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
-        if (mxgpu_native_render_available(-1))
+        if (vk_sampled_supported(format))
+            properties->linearTilingFeatures |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+        if (vk_color_attachment_supported(format))
+            properties->linearTilingFeatures |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+        if ((properties->linearTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) &&
+            mxgpu_native_render_available(-1) && (!host || (known && (caps.blendable & bit))))
             properties->linearTilingFeatures |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
-        if (mxgpu_native_sampler_available(-1))
+        if ((properties->linearTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) &&
+            mxgpu_native_sampler_available(-1) && host != MXGPU_FMT_R32_FLOAT && host != MXGPU_FMT_RG32_FLOAT &&
+            host != MXGPU_FMT_RGBA32_FLOAT)
             properties->linearTilingFeatures |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
         properties->optimalTilingFeatures = properties->linearTilingFeatures;
     }
@@ -6209,7 +6307,8 @@ static VkResult image_format_properties(VkPhysicalDevice physical, VkFormat form
     uint32_t depth_format = vk_depth_format(format);
     VkImageUsageFlags supported_usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (vk_color_format(format) != PIPE_FORMAT_NONE)
-        supported_usage |= VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        supported_usage |= (vk_sampled_supported(format) ? VK_IMAGE_USAGE_SAMPLED_BIT : 0) |
+                           (vk_color_attachment_supported(format) ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0);
     else if (depth_format && mxgpu_native_depth_available(-1, depth_format))
         supported_usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     else
@@ -6218,12 +6317,12 @@ static VkResult image_format_properties(VkPhysicalDevice physical, VkFormat form
         (tiling != VK_IMAGE_TILING_LINEAR && tiling != VK_IMAGE_TILING_OPTIMAL) || flags ||
         (usage & ~supported_usage))
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
-    properties->maxExtent = (VkExtent3D){MXGPU_VK_MAX_IMAGE_DIMENSION, MXGPU_VK_MAX_IMAGE_DIMENSION, 1};
-    properties->maxMipLevels = 12;
+    uint32_t dimension = vk_max_image_dimension();
+    properties->maxExtent = (VkExtent3D){dimension, dimension, 1};
+    properties->maxMipLevels = vk_mip_levels(dimension);
     properties->maxArrayLayers = 1;
     properties->sampleCounts = VK_SAMPLE_COUNT_1_BIT;
-    properties->maxResourceSize = (VkDeviceSize)MXGPU_VK_MAX_IMAGE_DIMENSION * MXGPU_VK_MAX_IMAGE_DIMENSION *
-                                  vk_format_bytes(format) * 2;
+    properties->maxResourceSize = vk_heap_bytes();
     return VK_SUCCESS;
 }
 
@@ -6323,7 +6422,7 @@ static void fill_vulkan11_properties(VkPhysicalDeviceVulkan11Properties *p)
     p->maxMultiviewInstanceIndex = 0;
     p->protectedNoFault = VK_FALSE;
     p->maxPerSetDescriptors = MXGPU_VK_MAX_PER_SET_DESCRIPTORS;
-    p->maxMemoryAllocationSize = MXGPU_VK_HEAP_BYTES;
+    p->maxMemoryAllocationSize = vk_heap_bytes();
 }
 
 static void device_props2(VkPhysicalDevice physical, VkPhysicalDeviceProperties2 *properties)

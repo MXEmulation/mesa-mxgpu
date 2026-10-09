@@ -20,3 +20,5 @@
 /src/mxgpu/vk_compute
 /src/mxgpu/vk_core11
 /src/mxgpu/vk_features
+/src/mxgpu/vk_webgpu
+/src/mxgpu/gl_textures

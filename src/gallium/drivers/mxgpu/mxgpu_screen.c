@@ -1668,7 +1668,8 @@ static bool read_texture_slice(struct pipe_sampler_view *view, unsigned level, u
         return false;
     width = u_minify(view->texture->width0, level);
     height = u_minify(view->texture->height0, level);
-    if (!width || !height || width > 4096 || height > 4096)
+    if (!width || !height || width > view->texture->screen->caps.max_texture_2d_size ||
+        height > view->texture->screen->caps.max_texture_2d_size)
         return false;
     block_height = util_format_get_blockheight(view->format);
     rows = util_format_get_nblocksy(view->format, height);
@@ -2785,7 +2786,8 @@ static void mxgpu_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_inf
     fs_constant_size = 0;
     cw = ctx->fb.width;
     ch = ctx->fb.height;
-    if (cw == 0 || ch == 0 || cw > 2048 || ch > 2048)
+    if (cw == 0 || ch == 0 || cw > ctx->base.screen->caps.max_texture_2d_size ||
+        ch > ctx->base.screen->caps.max_texture_2d_size)
         return;
     if (!ctx->module && !(ctx->module = MALLOC(MXGPU_LINK_MODULE_CAPACITY)))
         return;
@@ -3455,7 +3457,9 @@ static struct pipe_screen *screen_create(struct sw_winsys *winsys, int fd)
     caps->device_reset_status_query = fd >= 0;
     caps->max_render_targets = 1;
     caps->max_dual_source_render_targets = 0;
-    caps->max_texture_2d_size = 4096;
+    struct mxgpu_adapter_info adapter;
+    caps->max_texture_2d_size = fd >= 0 && mxgpu_adapter_limits(fd, &adapter) ?
+                                MIN2(adapter.max_texture_dimension_2d, 1u << (PIPE_MAX_TEXTURE_LEVELS - 1)) : 4096;
     caps->max_texture_cube_levels = fd >= 0 && mxgpu_native_cube_caps(fd) ? 13 : 0;
     caps->glsl_feature_level = 140;
     caps->glsl_feature_level_compatibility = 140;

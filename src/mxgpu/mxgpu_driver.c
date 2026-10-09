@@ -83,7 +83,7 @@ struct native_state_cache_entry {
 
 struct native_pipeline_cache_entry {
     uint8_t *module;
-    uint32_t bytes, shader_id, pipeline_id;
+    uint32_t bytes, shader_id, pipeline_id, color_format;
     int shader_live, pipeline_live;
     uint64_t used;
 };
@@ -177,6 +177,8 @@ struct device {
     int adapter_info_valid;
     struct mxgpu_drm_transfer_limits transfer_limits;
     struct mxgpu_drm_batch_limits batch_limits;
+    struct mxgpu_drm_compute_limits compute_limits;
+    int compute_limits_valid;
     struct scratch_buffer batch_commands, batch_record;
     struct mxgpu_drm_batch batch;
     uint32_t batch_bytes, batch_offsets[MXGPU_DRM_BATCH_MAX_COMMANDS];
@@ -581,8 +583,9 @@ static int batch_enqueue_unlocked(uint16_t opcode, uint16_t queue, uint32_t cont
         pins[transfer.resource_id] = 1;
     } else {
         struct mxgpu_render_extended render;
-        struct mxgpu_execution_binding bindings[19];
-        if (mxgpu_render_extended_decode(payload, payload_bytes, &render, bindings, 19) != MX_OK) return -1;
+        struct mxgpu_execution_binding bindings[3 + 2 * MXGPU_TEXTURE_INPUTS];
+        if (mxgpu_render_extended_decode(payload, payload_bytes, &render, bindings,
+                                         3 + 2 * MXGPU_TEXTURE_INPUTS) != MX_OK) return -1;
         for (unsigned i = 0; i < render.color_target_count; i++) {
             unsigned id = render.color_targets[i].resource_id;
             if (!id || id >= MXGPU_RESOURCE_SLOTS) return -1;
@@ -940,6 +943,8 @@ static int create_texture_resource(unsigned id, unsigned usage)
     g_dev.resources[id].host_mip_count = create.mip_levels;
     g_dev.resources[id].host_array_layers = create.array_layers;
     g_dev.resources[id].host_format = create.format;
+    g_dev.resources[id].host_current = 0;
+    g_dev.resources[id].upload_scheduled = 0;
     g_dev.resources[id].dirty_begin = 0;
     g_dev.resources[id].dirty_end = g_dev.resources[id].size;
     return 0;
@@ -960,7 +965,8 @@ static unsigned upload_limit(void)
 
 static unsigned resource_pixel_bytes(const struct resource *res)
 {
-    return res->format == MXGPU_FMT_DEPTH32_FLOAT_STENCIL8 ? 8 : 4;
+    unsigned bytes = res->format ? mxgpu_format_bytes_per_pixel((uint16_t)res->format) : 4u;
+    return bytes ? bytes : 4u;
 }
 
 static int transfer_span(struct resource *res, unsigned id, unsigned offset, unsigned length, unsigned y, unsigned height, unsigned level, unsigned layer)
@@ -1819,16 +1825,25 @@ static int native_pipeline_entry_destroy(struct native_pipeline_cache_entry *ent
     return 0;
 }
 
+static unsigned immediate_color_format(void);
+
+static uint32_t target_color_format(void)
+{
+    unsigned format = g_dev.framebuffer && g_dev.color_id && g_dev.framebuffer->resource_id == g_dev.color_id ?
+                      g_dev.framebuffer->format : immediate_color_format();
+    return format ? format : MXGPU_FMT_RGBA8_UNORM;
+}
+
 static int ensure_native_pipeline(void)
 {
     struct native_pipeline_cache_entry *entry = NULL, *victim = NULL;
     uint8_t payload[64];
-    uint32_t bytes;
+    uint32_t bytes, color_format = target_color_format();
     unsigned i;
     if (g_dev.lost) return -1;
     for (i = 0; i < MXGPU_MODULE_CACHE_ENTRIES; i++) {
         struct native_pipeline_cache_entry *candidate = &g_dev.module_cache[i];
-        if (candidate->module && candidate->bytes == g_user_len &&
+        if (candidate->module && candidate->bytes == g_user_len && candidate->color_format == color_format &&
             memcmp(candidate->module, g_user_mod, g_user_len) == 0) {
             entry = candidate;
             break;
@@ -1849,6 +1864,7 @@ static int ensure_native_pipeline(void)
         entry = victim;
         entry->module = module;
         entry->bytes = g_user_len;
+        entry->color_format = color_format;
         entry->shader_id = entry->pipeline_id = ++g_dev.module_cache_next_id;
     }
     if (!entry->shader_live) {
@@ -1866,7 +1882,7 @@ static int ensure_native_pipeline(void)
     }
     if (!entry->pipeline_live) {
         if (mxgpu_pipeline_create_encode(entry->pipeline_id, MXGPU_PIPELINE_RENDER,
-                                         MXGPU_FMT_RGBA8_UNORM, entry->shader_id, 1, 2,
+                                         entry->color_format, entry->shader_id, 1, 2,
                                          payload, sizeof payload, &bytes) != MX_OK ||
             winsys_submit_ioctl(MXGPU_OP_PIPELINE_CREATE, MXGPU_QUEUE_CONTROL, g_dev.context, payload, bytes))
             return -1;
@@ -2276,8 +2292,7 @@ static int framebuffer_resource_acquire_unlocked(struct mxgpu_framebuffer *frame
 
 struct mxgpu_framebuffer *mxgpu_framebuffer_create(uint32_t width, uint32_t height)
 {
-    if (!width || !height || width > 2048 || height > 2048 ||
-        (uint64_t)width * height > UINT_MAX / 4u) return NULL;
+    if (!width || !height || (uint64_t)width * height > UINT_MAX / 4u) return NULL;
     struct mxgpu_framebuffer *framebuffer = calloc(1, sizeof *framebuffer);
     if (!framebuffer) return NULL;
     framebuffer->size = width * height * 4u;
@@ -2294,7 +2309,7 @@ struct mxgpu_framebuffer *mxgpu_depth_framebuffer_create(uint32_t width, uint32_
 {
     uint32_t pixel_bytes = format == MXGPU_FMT_DEPTH32_FLOAT_STENCIL8 ? 8u : 4u;
     if ((format != MXGPU_FMT_DEPTH32_FLOAT && format != MXGPU_FMT_DEPTH32_FLOAT_STENCIL8 &&
-         format != MXGPU_FMT_DEPTH24_UNORM_STENCIL8) || !width || !height || width > 2048 || height > 2048 ||
+         format != MXGPU_FMT_DEPTH24_UNORM_STENCIL8) || !width || !height ||
         (uint64_t)width * height > UINT_MAX / pixel_bytes) return NULL;
     struct mxgpu_framebuffer *framebuffer = calloc(1, sizeof *framebuffer);
     if (!framebuffer) return NULL;
@@ -2575,7 +2590,28 @@ static int query_adapter_unlocked(void)
     return 0;
 }
 
-static int native_color_sample_available_unlocked(void)
+#define MXGPU_SOFTWARE_MAX_DIMENSION 2048u
+
+static int target_extent_ok_unlocked(unsigned width, unsigned height)
+{
+    if (!width || !height) return 0;
+    if (g_dev.fd < 0)
+        return width <= MXGPU_SOFTWARE_MAX_DIMENSION && height <= MXGPU_SOFTWARE_MAX_DIMENSION;
+    return !query_adapter_unlocked() && width <= g_dev.adapter_info.max_texture_dimension_2d &&
+           height <= g_dev.adapter_info.max_texture_dimension_2d;
+}
+
+int mxgpu_adapter_limits(int fd, struct mxgpu_adapter_info *info)
+{
+    pthread_mutex_lock(&g_device_mutex);
+    int result = fd >= 0 ? mxgpu_device_open_fd_unlocked(fd) : mxgpu_device_open_unlocked();
+    result = !result && g_dev.fd >= 0 && !query_adapter_unlocked();
+    if (result && info) *info = g_dev.adapter_info;
+    pthread_mutex_unlock(&g_device_mutex);
+    return result;
+}
+
+static int format_caps_unlocked(void)
 {
     if (g_dev.lost || g_dev.fd < 0 ||
         mxgpu_format_capabilities_features(g_dev.caps.features) != MX_OK || query_adapter_unlocked()) return 0;
@@ -2604,8 +2640,67 @@ static int native_color_sample_available_unlocked(void)
         g_dev.format_caps_valid = 1;
     }
     uint32_t encoded_size;
-    if (mxgpu_format_capabilities_encode(&g_dev.format_caps, g_dev.adapter_info.pixel_format_mask,
-            NULL, 0, &encoded_size) != MX_OK) return 0;
+    return mxgpu_format_capabilities_encode(&g_dev.format_caps, g_dev.adapter_info.pixel_format_mask,
+                                            NULL, 0, &encoded_size) == MX_OK;
+}
+
+static int format_is_depth(uint32_t format)
+{
+    return format == MXGPU_FMT_DEPTH32_FLOAT || format == MXGPU_FMT_DEPTH32_FLOAT_STENCIL8 ||
+           format == MXGPU_FMT_DEPTH24_UNORM_STENCIL8;
+}
+
+static int format_is_float_color(uint32_t format)
+{
+    return format && format < MXGPU_FMT_R8_UINT && !format_is_depth(format);
+}
+
+static int sampled_format_unlocked(uint32_t format)
+{
+    if (!format || format == MXGPU_FMT_RGBA8_UNORM) return 1;
+    return format_is_float_color(format) && format_caps_unlocked() &&
+           (g_dev.format_caps.sampled & g_dev.format_caps.transfer_destination & (1u << (format - 1u)));
+}
+
+static int color_target_format_unlocked(uint32_t format)
+{
+    if (!format || format == MXGPU_FMT_RGBA8_UNORM) return 1;
+    return format_is_float_color(format) && format_caps_unlocked() &&
+           (g_dev.format_caps.color_target & g_dev.format_caps.transfer_source &
+            g_dev.format_caps.transfer_destination & (1u << (format - 1u)));
+}
+
+int mxgpu_format_caps(int fd, struct mxgpu_format_capabilities *caps)
+{
+    pthread_mutex_lock(&g_device_mutex);
+    int result = fd >= 0 ? mxgpu_device_open_fd_unlocked(fd) : mxgpu_device_open_unlocked();
+    result = !result && format_caps_unlocked();
+    if (result && caps) *caps = g_dev.format_caps;
+    pthread_mutex_unlock(&g_device_mutex);
+    return result;
+}
+
+int mxgpu_sampled_format_supported(int fd, uint32_t format)
+{
+    pthread_mutex_lock(&g_device_mutex);
+    int result = fd >= 0 ? mxgpu_device_open_fd_unlocked(fd) : mxgpu_device_open_unlocked();
+    result = !result && g_dev.fd >= 0 && sampled_format_unlocked(format);
+    pthread_mutex_unlock(&g_device_mutex);
+    return result;
+}
+
+int mxgpu_color_target_format_supported(int fd, uint32_t format)
+{
+    pthread_mutex_lock(&g_device_mutex);
+    int result = fd >= 0 ? mxgpu_device_open_fd_unlocked(fd) : mxgpu_device_open_unlocked();
+    result = !result && g_dev.fd >= 0 && color_target_format_unlocked(format);
+    pthread_mutex_unlock(&g_device_mutex);
+    return result;
+}
+
+static int native_color_sample_available_unlocked(void)
+{
+    if (!format_caps_unlocked()) return 0;
     uint32_t bit = 1u << (MXGPU_FMT_RGBA8_UNORM - 1u);
     return (g_dev.format_caps.sampled & g_dev.format_caps.color_target &
             g_dev.format_caps.transfer_source & g_dev.format_caps.transfer_destination & bit) != 0;
@@ -2932,8 +3027,9 @@ static int texture_is_framebuffer_alias(unsigned index, unsigned id)
 static int draw_scene(void)
 {
     struct mxgpu_render_submit submit;
-    struct mxgpu_execution_binding bindings[19];
-    uint8_t payload[1024];
+    struct mxgpu_execution_binding bindings[3 + 2 * MXGPU_TEXTURE_INPUTS];
+    uint8_t payload[MXGPU_RENDER_EXTENDED_HEADER_SIZE + MXGPU_COLOR_ATTACHMENT_SIZE + MXGPU_VIEWPORT_SIZE +
+                    MXGPU_SCISSOR_SIZE + (3 + 2 * MXGPU_TEXTURE_INPUTS) * MXGPU_EXECUTION_BINDING_SIZE];
     uint32_t n = 0;
     unsigned stage;
     struct mxgpu_framebuffer *clear_target = g_dev.native_active && g_dev.framebuffer &&
@@ -3038,7 +3134,8 @@ static int draw_scene(void)
         }
         extended.color_target_count = 1;
         extended.color_targets[0].resource_id = submit.color_target_id;
-        extended.color_targets[0].format = MXGPU_FMT_RGBA8_UNORM;
+        extended.color_targets[0].format = g_dev.resources[g_dev.color_id].format ?
+                                           g_dev.resources[g_dev.color_id].format : MXGPU_FMT_RGBA8_UNORM;
         extended.color_targets[0].load_action = submit.load_action;
         extended.color_targets[0].store_action = submit.store_action;
         if (clear_target) {
@@ -3087,7 +3184,8 @@ static int draw_scene(void)
         depth_clear->pending = depth_clear->unpublished = 1;
     }
     g_readback_done = 0;
-    if (!g_dev.deferred_readback && g_dev.fd >= 0 && (unsigned long)g_rt_w * g_rt_h * 4u <= readback_limit()) {
+    if (!g_dev.deferred_readback && g_dev.fd >= 0 &&
+        (unsigned long)g_rt_w * g_rt_h * resource_pixel_bytes(&g_dev.resources[g_dev.color_id]) <= readback_limit()) {
         const char *reason = mxgpu_readback_reason("draw-immediate");
         int read = readback_color();
         mxgpu_readback_reason(reason);
@@ -3148,13 +3246,22 @@ static int replace_bytes(unsigned id, const void *data, unsigned size, unsigned 
     return 0;
 }
 
+static unsigned immediate_color_format(void)
+{
+    unsigned format = g_dev.native_active ? g_dev.native_state.color_format : 0;
+    return format == MXGPU_FMT_RGBA8_UNORM ? 0 : format;
+}
+
 static int ensure_color_resource(unsigned width, unsigned height)
 {
     struct resource *color;
     unsigned bytes;
-    if (!width || !height || (uint64_t)width * height > UINT_MAX / 4u)
+    int owned = g_dev.framebuffer && g_dev.color_id && g_dev.framebuffer->resource_id == g_dev.color_id;
+    unsigned format = owned ? res_slot(g_dev.color_id)->format : immediate_color_format();
+    unsigned pixel_bytes = format ? mxgpu_format_bytes_per_pixel((uint16_t)format) : 4u;
+    if (!width || !height || !pixel_bytes || (uint64_t)width * height > UINT_MAX / pixel_bytes)
         return -1;
-    bytes = width * height * 4u;
+    bytes = width * height * pixel_bytes;
     if (!g_dev.color_id) {
         unsigned id = new_resource(MXGPU_KIND_TEXTURE_2D, width, height, bytes);
         if (!id)
@@ -3166,13 +3273,14 @@ static int ensure_color_resource(unsigned width, unsigned height)
     color = res_slot(g_dev.color_id);
     if (!color)
         return -1;
-    if (color->width != width || color->height != height) {
+    if (color->width != width || color->height != height || color->size != bytes) {
         if (replace_bytes(g_dev.color_id, NULL, bytes, width, height))
             return -1;
         g_needs_clear = 1;
     }
+    color->format = format;
     unsigned usage = MXGPU_USAGE_COLOR_TARGET | MXGPU_USAGE_TRANSFER_SOURCE |
-                     MXGPU_USAGE_SCANOUT | MXGPU_USAGE_TRANSFER_DESTINATION;
+                     (format ? 0 : MXGPU_USAGE_SCANOUT) | MXGPU_USAGE_TRANSFER_DESTINATION;
     if (g_dev.framebuffer && g_dev.framebuffer->resource_id == g_dev.color_id &&
         ((color->host_live && (color->host_usage & MXGPU_USAGE_SAMPLED)) ||
          (!color->host_live && native_color_sample_available_unlocked()))) usage |= MXGPU_USAGE_SAMPLED;
@@ -3183,9 +3291,8 @@ static int mxgpu_seed_color_unlocked(const unsigned char *pixels, unsigned width
 {
     struct resource *color;
     if (!g_dev.deferred_readback && framebuffer_detach_unlocked()) return -1;
-    if (!pixels || !width || !height || width > 2048 || height > 2048)
-        return -1;
-    if (mxgpu_device_open_unlocked() != 0 || ensure_color_resource(width, height) != 0)
+    if (!pixels || mxgpu_device_open_unlocked() != 0 || !target_extent_ok_unlocked(width, height) ||
+        ensure_color_resource(width, height) != 0)
         return -1;
     color = res_slot(g_dev.color_id);
     if ((!g_dev.native_active && g_needs_clear) || memcmp(color->bytes, pixels, color->size) != 0) {
@@ -3290,7 +3397,8 @@ static unsigned texture_input_bytes(const struct mxgpu_texture_input *input)
     unsigned layers = input->array_layers ? input->array_layers : 1;
     unsigned kind = input->binding_kind ? input->binding_kind : MXGPU_BIND_KIND_TEXTURE_2D;
     unsigned format = input->format ? input->format : MXGPU_FMT_RGBA8_UNORM;
-    if ((format != MXGPU_FMT_RGBA8_UNORM && format != MXGPU_FMT_DEPTH32_FLOAT) ||
+    unsigned pixel_bytes = mxgpu_format_bytes_per_pixel((uint16_t)format);
+    if ((format != MXGPU_FMT_DEPTH32_FLOAT && !format_is_float_color(format)) || !pixel_bytes ||
         (kind != MXGPU_BIND_KIND_TEXTURE_2D && kind != MXGPU_BIND_KIND_TEXTURE_CUBE) ||
         (kind == MXGPU_BIND_KIND_TEXTURE_CUBE ? (layers != 6 || input->width != input->height) : layers != 1)) return 0;
     unsigned count = input->mip_count ? input->mip_count : 1;
@@ -3304,7 +3412,7 @@ static unsigned texture_input_bytes(const struct mxgpu_texture_input *input)
         if (!height) height = 1;
         if (input->mip_count && (!input->levels[level].pixels ||
             input->levels[level].width != width || input->levels[level].height != height)) return 0;
-        total += (uint64_t)width * height * 4u * layers;
+        total += (uint64_t)width * height * pixel_bytes * layers;
         if (total > UINT_MAX) return 0;
     }
     return (unsigned)total;
@@ -3329,7 +3437,8 @@ static int texture_inputs_equal(const struct mxgpu_texture_input *a, const struc
         const uint8_t *right = b->mip_count ? b->levels[i].pixels : b->pixels;
         unsigned width = a->mip_count ? a->levels[i].width : a->width;
         unsigned height = a->mip_count ? a->levels[i].height : a->height;
-        if (memcmp(left, right, (size_t)width * height * layers * 4u)) return 0;
+        unsigned pixel_bytes = mxgpu_format_bytes_per_pixel((uint16_t)(a->format ? a->format : MXGPU_FMT_RGBA8_UNORM));
+        if (memcmp(left, right, (size_t)width * height * layers * pixel_bytes)) return 0;
     }
     return 1;
 }
@@ -3359,6 +3468,7 @@ static int replace_texture_input(unsigned id, const struct mxgpu_texture_input *
     unsigned bytes = texture_input_bytes(input), count = input->mip_count ? input->mip_count : 1;
     unsigned layers = input->array_layers ? input->array_layers : 1;
     unsigned format = input->format ? input->format : MXGPU_FMT_RGBA8_UNORM;
+    unsigned pixel_bytes = mxgpu_format_bytes_per_pixel((uint16_t)format);
     struct resource *resource = res_slot(id);
     if (!bytes || !resource) return -1;
     if (input->identity && bytes > resource->size && g_dev.fd >= 0 &&
@@ -3374,7 +3484,7 @@ static int replace_texture_input(unsigned id, const struct mxgpu_texture_input *
         if (!packed) return -1;
         unsigned offset = 0;
         for (unsigned level = 0; level < count; level++) {
-            unsigned size = input->levels[level].width * input->levels[level].height * 4u * layers;
+            unsigned size = input->levels[level].width * input->levels[level].height * pixel_bytes * layers;
             memcpy(packed + offset, input->levels[level].pixels, size);
             offset += size;
         }
@@ -3392,7 +3502,7 @@ static int replace_texture_input(unsigned id, const struct mxgpu_texture_input *
         if (!width) width = 1;
         if (!height) height = 1;
         resource->mip_offsets[level] = offset;
-        offset += width * height * 4u * layers;
+        offset += width * height * pixel_bytes * layers;
     }
     return 0;
 }
@@ -3410,7 +3520,7 @@ static int mxgpu_execute_module_uniforms_unlocked(const uint8_t *module, uint32_
     unsigned stage;
     if (!g_dev.deferred_readback && framebuffer_detach_unlocked()) return -1;
     const char *inject;
-    if (!module || module_len == 0 || module_len > sizeof g_user_mod || !vertices || vertex_count < 3 || (!texels && !g_dev.draw_texture_count) || tw < 1 || th < 1 || !color || cw < 1 || ch < 1 || cw > 2048 || ch > 2048)
+    if (!module || module_len == 0 || module_len > sizeof g_user_mod || !vertices || vertex_count < 3 || (!texels && !g_dev.draw_texture_count) || tw < 1 || th < 1 || !color || cw < 1 || ch < 1)
         return -1;
     if (!vertex_stride_bytes || vertex_stride_bytes % 16u || vertex_stride_bytes > MXGPU_SHADER_VERTEX_SLOTS * 16u ||
         (unsigned)vertex_count > UINT_MAX / vertex_stride_bytes ||
@@ -3431,7 +3541,7 @@ static int mxgpu_execute_module_uniforms_unlocked(const uint8_t *module, uint32_
     g_rt_w = (unsigned)cw;
     g_rt_h = (unsigned)ch;
     g_readback_done = 0;
-    if (mxgpu_device_open_unlocked() != 0)
+    if (mxgpu_device_open_unlocked() != 0 || !target_extent_ok_unlocked((unsigned)cw, (unsigned)ch))
         return -1;
     uint32_t vertex_used = (unsigned)vertex_count * vertex_stride_bytes;
     uint32_t vertex_capacity;
@@ -3522,7 +3632,7 @@ static int mxgpu_execute_module_uniforms_unlocked(const uint8_t *module, uint32_
         g_readback_done = 1;
     }
     if (!g_dev.deferred_readback && !(g_dev.native_active && g_dev.native_state.depth_enabled))
-        memcpy(color, dst->bytes, (size_t)cw * (size_t)ch * 4u);
+        memcpy(color, dst->bytes, dst->size);
     if (getenv("MXGPU_TRACE"))
         fprintf(stderr, "submits %u\n", g_dev.frame_submits);
     if (!g_dev.batch.count) completed_submit_proof();
@@ -3606,6 +3716,20 @@ static int device_initialize(int fd, int allow_executor)
             if (!mxgpu_ioctl(fd, DRM_IOWR(DRM_COMMAND_BASE + MXGPU_DRM_IOCTL_GET_BATCH_LIMITS,
                                    struct mxgpu_drm_user), &batch_user) && batch_user.size <= sizeof batch_record)
                 mxgpu_drm_get_batch_limits_response_decode(batch_record, batch_user.size, &g_dev.batch_limits);
+        }
+        uint8_t compute_record[MXGPU_DRM_HEADER_SIZE + MXGPU_DRM_COMPUTE_LIMITS_BYTES];
+        uint32_t compute_size;
+        struct mxgpu_drm_user compute_user = {0};
+        if (mxgpu_drm_get_compute_limits_encode(compute_record, sizeof compute_record, &compute_size) == MXGPU_DRM_OK) {
+            compute_user.pointer = (uint64_t)(uintptr_t)compute_record;
+            compute_user.size = compute_size;
+            compute_user.capacity = sizeof compute_record;
+            g_dev.compute_limits_valid =
+                !mxgpu_ioctl(fd, DRM_IOWR(DRM_COMMAND_BASE + MXGPU_DRM_IOCTL_GET_COMPUTE_LIMITS,
+                                          struct mxgpu_drm_user), &compute_user) &&
+                compute_user.size <= sizeof compute_record &&
+                mxgpu_drm_get_compute_limits_response_decode(compute_record, compute_user.size,
+                                                             &g_dev.compute_limits) == MXGPU_DRM_OK;
         }
         uint8_t record[MXGPU_DRM_HEADER_SIZE + 8];
         uint32_t size;
@@ -3944,8 +4068,14 @@ static int execute_module_transaction_resources(int fd, const uint8_t *module, u
                  input->sampler_slot == textures[j].texture_slot || input->texture_slot == textures[j].sampler_slot))) goto invalid_arguments;
     }
     result = fd >= 0 ? mxgpu_device_open_fd_unlocked(fd) : mxgpu_device_open_unlocked();
+    if (!result && state && state->color_format && state->color_format != MXGPU_FMT_RGBA8_UNORM &&
+        (framebuffer || g_dev.fd < 0 || !color_target_format_unlocked(state->color_format) ||
+         (state->blend.targets[0].enable &&
+          !(g_dev.format_caps.blendable & (1u << (state->color_format - 1u)))))) result = -1;
     for (unsigned texture = 0; texture < texture_count && !result; texture++) {
         const struct mxgpu_texture_input *input = &textures[texture];
+        if (input->format && input->format != MXGPU_FMT_RGBA8_UNORM && input->format != MXGPU_FMT_DEPTH32_FLOAT &&
+            (g_dev.fd < 0 || !sampled_format_unlocked(input->format))) result = -1;
         if (input->binding_kind == MXGPU_BIND_KIND_TEXTURE_CUBE &&
             (g_dev.fd < 0 || g_dev.caps.major != 1 || g_dev.caps.minor < 28 ||
              !(g_dev.caps.features & MXGPU_FEAT_TEXTURE_ARRAY))) result = -1;
@@ -4595,6 +4725,15 @@ int mxgpu_compute_available(void)
 {
     pthread_mutex_lock(&g_device_mutex);
     int available = compute_ready_unlocked();
+    pthread_mutex_unlock(&g_device_mutex);
+    return available;
+}
+
+int mxgpu_compute_limits(struct mxgpu_drm_compute_limits *limits)
+{
+    pthread_mutex_lock(&g_device_mutex);
+    int available = compute_ready_unlocked() && g_dev.compute_limits_valid;
+    if (available && limits) *limits = g_dev.compute_limits;
     pthread_mutex_unlock(&g_device_mutex);
     return available;
 }

@@ -58,7 +58,7 @@ int mxgpu_execute_module_transaction(int fd, const uint8_t *module, uint32_t mod
                          const void *vertex_uniforms, uint32_t vertex_uniform_size,
                          const void *fragment_uniforms, uint32_t fragment_uniform_size,
                          int *readback_complete);
-#define MXGPU_TEXTURE_INPUTS 8u
+#define MXGPU_TEXTURE_INPUTS 16u
 struct mxgpu_texture_level {
     const unsigned char *pixels;
     uint32_t width, height;
@@ -108,6 +108,7 @@ struct mxgpu_native_render_state {
     uint32_t stencil_reference;
     int bounds_valid;
     struct mxgpu_scissor bounds;
+    uint32_t color_format;
 };
 struct mxgpu_framebuffer;
 struct mxgpu_framebuffer *mxgpu_framebuffer_create(uint32_t width, uint32_t height);
@@ -126,6 +127,10 @@ int mxgpu_framebuffer_refresh(struct mxgpu_framebuffer *framebuffer, const unsig
                               uint32_t source_stride, mxgpu_row_convert convert, unsigned convert_arg,
                               uint64_t cpu_revision);
 int mxgpu_native_render_caps(int fd);
+int mxgpu_adapter_limits(int fd, struct mxgpu_adapter_info *info);
+int mxgpu_format_caps(int fd, struct mxgpu_format_capabilities *caps);
+int mxgpu_sampled_format_supported(int fd, uint32_t format);
+int mxgpu_color_target_format_supported(int fd, uint32_t format);
 int mxgpu_native_mip_caps(int fd);
 int mxgpu_native_cube_caps(int fd);
 int mxgpu_native_shadow_caps(int fd);
@@ -173,6 +178,7 @@ struct mxgpu_compute_binding {
     uint64_t size;
 };
 int mxgpu_compute_available(void);
+int mxgpu_compute_limits(struct mxgpu_drm_compute_limits *limits);
 uint32_t mxgpu_storage_buffer_create(uint32_t size);
 int mxgpu_storage_buffer_upload(uint32_t buffer, uint32_t offset, const void *data, uint32_t size);
 int mxgpu_storage_buffer_read(uint32_t buffer, uint32_t offset, void *data, uint32_t size);
