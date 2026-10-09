@@ -25,13 +25,14 @@
 #include <unistd.h>
 
 
-#define MXGPU_RESOURCE_SLOTS 128u
+#define MXGPU_RESOURCE_SLOTS 256u
 #define MXGPU_FRAMEBUFFER_CACHE_ENTRIES 32u
 #define MXGPU_FRAMEBUFFER_CACHE_BYTES (128ull * 1024u * 1024u)
-#define MXGPU_TEXTURE_CACHE_ENTRIES 32u
+#define MXGPU_TEXTURE_CACHE_ENTRIES 64u
 #define MXGPU_VERTEX_CACHE_ENTRIES 32u
 #define MXGPU_VERTEX_CACHE_BYTES (16ull * 1024u * 1024u)
-#define MXGPU_UNIFORM_CACHE_ENTRIES 8u
+#define MXGPU_UNIFORM_CACHE_ENTRIES MXGPU_DRM_BATCH_MAX_COMMANDS
+#define MXGPU_UNIFORM_CACHE_MINIMUM 8u
 #define MXGPU_UNIFORM_CACHE_BYTES (8ull * 1024u * 1024u)
 #define MXGPU_TEXTURE_CACHE_BYTES (128ull * 1024u * 1024u)
 #define MXGPU_MODULE_CACHE_ENTRIES 64u
@@ -64,7 +65,7 @@ struct resource {
 struct shader_image {
     int live;
     unsigned len;
-    unsigned char bytes[MXGPU_LINK_MODULE_CAPACITY];
+    unsigned char *bytes;
 };
 
 struct pipeline_image {
@@ -122,8 +123,9 @@ struct mxgpu_framebuffer {
     unsigned char *pixels;
     uint32_t width, height, size, format, pixel_bytes;
     uint64_t cpu_revision;
-    int valid, pending, error, unpublished, clear_pending;
-    unsigned char clear_bytes[4];
+    int valid, pending, error, unpublished, clear_pending, depth_load_clear, stencil_load_clear;
+    unsigned char clear_bytes[8], clear_mask[8];
+    uint32_t depth_clear_bits, stencil_clear_value;
     uint32_t pending_top, pending_bottom, unpublished_top, unpublished_bottom;
     unsigned resource_id;
     int resource_blocked;
@@ -180,7 +182,7 @@ struct device {
     uint32_t batch_bytes, batch_offsets[MXGPU_DRM_BATCH_MAX_COMMANDS];
     uint64_t batch_sequences[MXGPU_DRM_BATCH_MAX_COMMANDS];
     uint16_t batch_opcodes[MXGPU_DRM_BATCH_MAX_COMMANDS];
-    int batch_collect;
+    int batch_collect, batch_depth, depth_batch_unsupported;
     struct mxgpu_native_render_state native_state;
     int native_active;
     uint32_t native_state_id;
@@ -207,6 +209,7 @@ static int compute_pipeline_entry_destroy(struct compute_pipeline_entry *entry);
 static struct device g_dev = {.fd = -1};
 static pthread_mutex_t g_device_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int batch_drain_unlocked(void);
+static int winsys_submit_direct(uint16_t opcode, uint16_t queue, uint32_t context, const uint8_t *payload, uint32_t payload_len);
 static int vertex_cache_trim_unlocked(unsigned preserve, uint32_t replacement_size);
 static int uniform_cache_trim_unlocked(unsigned preserve, uint32_t replacement_size);
 static int framebuffer_trim_bytes_unlocked(struct mxgpu_framebuffer *preserve);
@@ -276,6 +279,43 @@ static void write_log(const char *leaf, const char *text)
         return;
     fputs(text, log);
     fclose(log);
+}
+
+#define MXGPU_READBACK_REASONS 24u
+
+static __thread const char *g_readback_reason;
+static struct {
+    const char *reason;
+    unsigned long long calls, bytes;
+} g_readback_trace[MXGPU_READBACK_REASONS];
+
+const char *mxgpu_readback_reason(const char *reason)
+{
+    const char *previous = g_readback_reason;
+    g_readback_reason = reason;
+    return previous;
+}
+
+static void readback_trace(unsigned bytes)
+{
+    const char *reason = g_readback_reason ? g_readback_reason : "untagged";
+    char text[MXGPU_READBACK_REASONS * 64], leaf[64];
+    size_t used = 0;
+    unsigned i;
+    if (!getenv("MXGPU_LOG_DIR"))
+        return;
+    for (i = 0; i < MXGPU_READBACK_REASONS && g_readback_trace[i].reason &&
+         strcmp(g_readback_trace[i].reason, reason); i++) {}
+    if (i == MXGPU_READBACK_REASONS)
+        return;
+    g_readback_trace[i].reason = reason;
+    g_readback_trace[i].calls++;
+    g_readback_trace[i].bytes += bytes;
+    for (i = 0; i < MXGPU_READBACK_REASONS && g_readback_trace[i].reason && used < sizeof text; i++)
+        used += snprintf(text + used, sizeof text - used, "%s %llu %llu\n", g_readback_trace[i].reason,
+                         g_readback_trace[i].calls, g_readback_trace[i].bytes);
+    snprintf(leaf, sizeof leaf, "readback-%d.log", (int)getpid());
+    write_log(leaf, text);
 }
 
 static int open_render_node(char *path, size_t path_size)
@@ -409,6 +449,55 @@ static void completed_submit_proof(void)
     }
 }
 
+static void batch_complete_unlocked(void)
+{
+    for (unsigned i = 1; i < MXGPU_RESOURCE_SLOTS; i++) {
+        struct resource *resource = &g_dev.resources[i];
+        resource->batch_pinned = 0;
+        if (resource->upload_scheduled) {
+            resource->host_current = 1;
+            resource->upload_scheduled = 0;
+            resource->dirty_begin = resource->dirty_end = 0;
+        }
+    }
+    g_dev.batch.count = g_dev.batch_bytes = 0;
+    g_dev.batch_depth = 0;
+    completed_submit_proof();
+}
+
+static void batch_fail_unlocked(void)
+{
+    g_dev.lost = 1;
+    for (unsigned i = 0; i < MXGPU_FRAMEBUFFER_CACHE_ENTRIES; i++)
+        if (g_dev.framebuffer_cache[i] && g_dev.framebuffer_cache[i]->pending)
+            g_dev.framebuffer_cache[i]->error = 1;
+}
+
+static int batch_replay_unlocked(int rejected_errno)
+{
+    unsigned count = g_dev.batch.count;
+    uint32_t max = g_dev.caps.max_command_bytes ? g_dev.caps.max_command_bytes : 512u * 1024u;
+    if (g_dev.batch_depth && rejected_errno == EINVAL)
+        g_dev.depth_batch_unsupported = 1;
+    g_dev.batch.count = 0;
+    for (unsigned i = 0; i < count; i++) {
+        struct mxgpu_command_header header;
+        const uint8_t *payload;
+        uint32_t payload_len;
+        if (mxgpu_command_decode(g_dev.batch_commands.bytes + g_dev.batch_offsets[i],
+                                 g_dev.batch.commands[i].command_bytes, max, &header, &payload,
+                                 &payload_len) != MX_OK ||
+            winsys_submit_direct(header.opcode, header.queue, header.context_id, payload, payload_len)) {
+            int saved_errno = errno;
+            batch_fail_unlocked();
+            errno = saved_errno;
+            return -1;
+        }
+    }
+    batch_complete_unlocked();
+    return 0;
+}
+
 static int batch_drain_unlocked(void)
 {
     if (g_dev.lost) return -1;
@@ -464,25 +553,19 @@ static int batch_drain_unlocked(void)
         }
         completed_submit_proof();
     }
+    if (valid && response.aggregate_result == MXGPU_DRM_BATCH_REJECTED) {
+        int posted = 0;
+        for (unsigned i = 0; i < response.count; i++)
+            posted |= response.outcomes[i].state != MXGPU_DRM_BATCH_NOT_POSTED;
+        if (!posted)
+            return batch_replay_unlocked(result ? saved_errno : EINVAL);
+    }
     if (!valid || result || response.aggregate_result != MXGPU_DRM_BATCH_COMPLETE) {
-        g_dev.lost = 1;
-        for (unsigned i = 0; i < MXGPU_FRAMEBUFFER_CACHE_ENTRIES; i++)
-            if (g_dev.framebuffer_cache[i] && g_dev.framebuffer_cache[i]->pending)
-                g_dev.framebuffer_cache[i]->error = 1;
+        batch_fail_unlocked();
         errno = result ? saved_errno : EIO;
         return -1;
     }
-    for (unsigned i = 1; i < MXGPU_RESOURCE_SLOTS; i++) {
-        struct resource *resource = &g_dev.resources[i];
-        resource->batch_pinned = 0;
-        if (resource->upload_scheduled) {
-            resource->host_current = 1;
-            resource->upload_scheduled = 0;
-            resource->dirty_begin = resource->dirty_end = 0;
-        }
-    }
-    g_dev.batch.count = g_dev.batch_bytes = 0;
-    completed_submit_proof();
+    batch_complete_unlocked();
     return 0;
 }
 
@@ -508,6 +591,7 @@ static int batch_enqueue_unlocked(uint16_t opcode, uint16_t queue, uint32_t cont
         if (render.depth_stencil_target_id) {
             if (render.depth_stencil_target_id >= MXGPU_RESOURCE_SLOTS) return -1;
             pins[render.depth_stencil_target_id] = 1;
+            g_dev.batch_depth = 1;
         }
         for (unsigned i = 0; i < render.binding_count; i++) {
             if (bindings[i].kind == MXGPU_BIND_KIND_SAMPLER) continue;
@@ -554,7 +638,16 @@ static int winsys_submit_ioctl(uint16_t opcode, uint16_t queue, uint32_t context
         context == g_dev.context && (opcode == MXGPU_OP_TRANSFER_TO_HOST ||
         opcode == MXGPU_OP_RENDER_SUBMIT_EXTENDED))
         return batch_enqueue_unlocked(opcode, queue, context, payload, payload_len);
-    if (batch_drain_unlocked()) return -1;
+    int independent = opcode == MXGPU_OP_RESOURCE_CREATE || opcode == MXGPU_OP_SHADER_CREATE ||
+        opcode == MXGPU_OP_PIPELINE_CREATE || opcode == MXGPU_OP_BLEND_STATE_CREATE ||
+        opcode == MXGPU_OP_RASTERIZER_STATE_CREATE || opcode == MXGPU_OP_DEPTH_STENCIL_STATE_CREATE ||
+        opcode == MXGPU_OP_SAMPLER_CREATE;
+    if (!independent && batch_drain_unlocked()) return -1;
+    return winsys_submit_direct(opcode, queue, context, payload, payload_len);
+}
+
+static int winsys_submit_direct(uint16_t opcode, uint16_t queue, uint32_t context, const uint8_t *payload, uint32_t payload_len)
+{
     struct mxgpu_command_header header;
     struct mxgpu_drm_user user;
     uint8_t *command;
@@ -1630,8 +1723,10 @@ static int apply_decoded(uint16_t opcode, const uint8_t *payload, uint32_t len)
             return -1;
         if (opcode == MXGPU_OP_PIPELINE_DESTROY)
             memset(&g_dev.pipes[id], 0, sizeof g_dev.pipes[id]);
-        else
+        else {
+            free(g_dev.shaders[id].bytes);
             memset(&g_dev.shaders[id], 0, sizeof g_dev.shaders[id]);
+        }
         return 0;
     }
     if (opcode == MXGPU_OP_SHADER_CREATE) {
@@ -1641,11 +1736,15 @@ static int apply_decoded(uint16_t opcode, const uint8_t *payload, uint32_t len)
             return -1;
         id = mx_r32(payload, 0);
         blen = mx_r32(payload, 4);
-        if (id == 0 || id >= 16 || blen == 0 || (blen & 3u) || MXGPU_SHADER_CREATE_HEADER_SIZE + blen != len || blen > sizeof g_dev.shaders[id].bytes)
+        if (id == 0 || id >= 16 || blen == 0 || (blen & 3u) || MXGPU_SHADER_CREATE_HEADER_SIZE + blen != len || blen > MXGPU_LINK_MODULE_CAPACITY)
             return -1;
         mxsb_limits_default(&limits);
         if (mxsb_verify(payload + MXGPU_SHADER_CREATE_HEADER_SIZE, blen, &limits) != MXSB_OK)
             return -1;
+        unsigned char *bytes = realloc(g_dev.shaders[id].bytes, blen);
+        if (!bytes)
+            return -1;
+        g_dev.shaders[id].bytes = bytes;
         memcpy(g_dev.shaders[id].bytes, payload + MXGPU_SHADER_CREATE_HEADER_SIZE, blen);
         g_dev.shaders[id].len = blen;
         g_dev.shaders[id].live = 1;
@@ -1921,6 +2020,7 @@ static int readback_rows(struct resource *color, unsigned y0, unsigned rows)
     if (posted < 0 || user.size != bytes) {
         return -1;
     }
+    readback_trace(bytes);
     if (!direct)
         for (i = 0; i < rows; i++)
             memcpy(color->bytes + (size_t)(g_dev.native_active ? y0 + i : color->height - 1u - (y0 + i)) * row,
@@ -1977,12 +2077,31 @@ static int readback_color(void)
     return readback_attachment(res_slot(g_dev.color_id));
 }
 
-static void fill_pixels(unsigned char *pixels, size_t bytes, const unsigned char value[4])
+static int framebuffer_clear_whole(const struct mxgpu_framebuffer *framebuffer)
 {
-    uint32_t word;
-    memcpy(&word, value, sizeof word);
-    for (size_t offset = 0; offset + sizeof word <= bytes; offset += sizeof word)
-        memcpy(pixels + offset, &word, sizeof word);
+    if (framebuffer->format == MXGPU_FMT_RGBA8_UNORM) return 1;
+    return framebuffer->depth_load_clear &&
+        (framebuffer->stencil_load_clear || framebuffer->format == MXGPU_FMT_DEPTH32_FLOAT);
+}
+
+static void framebuffer_clear_reset(struct mxgpu_framebuffer *framebuffer)
+{
+    framebuffer->clear_pending = framebuffer->depth_load_clear = framebuffer->stencil_load_clear = 0;
+    memset(framebuffer->clear_mask, 0, sizeof framebuffer->clear_mask);
+}
+
+static void fill_pixels(struct mxgpu_framebuffer *framebuffer)
+{
+    unsigned bytes = framebuffer->pixel_bytes;
+    if (framebuffer_clear_whole(framebuffer)) {
+        for (size_t offset = 0; offset + bytes <= framebuffer->size; offset += bytes)
+            memcpy(framebuffer->pixels + offset, framebuffer->clear_bytes, bytes);
+        return;
+    }
+    for (size_t offset = 0; offset + bytes <= framebuffer->size; offset += bytes)
+        for (unsigned byte = 0; byte < bytes; byte++)
+            if (framebuffer->clear_mask[byte])
+                framebuffer->pixels[offset + byte] = framebuffer->clear_bytes[byte];
 }
 
 static void framebuffer_rows_add(uint32_t *top, uint32_t *bottom, uint32_t first, uint32_t end)
@@ -2000,42 +2119,50 @@ static void framebuffer_rows_add(uint32_t *top, uint32_t *bottom, uint32_t first
 static int framebuffer_sync_unlocked(struct mxgpu_framebuffer *framebuffer)
 {
     if (batch_drain_unlocked() || !framebuffer || framebuffer->error) return -1;
-    if (framebuffer->clear_pending) {
-        struct resource *cleared = framebuffer->resource_id ? res_slot(framebuffer->resource_id) : NULL;
-        fill_pixels(framebuffer->pixels, framebuffer->size, framebuffer->clear_bytes);
-        framebuffer->clear_pending = 0;
+    struct resource *resident = framebuffer->resource_id ? res_slot(framebuffer->resource_id) : NULL;
+    if (framebuffer->clear_pending && framebuffer_clear_whole(framebuffer)) {
+        fill_pixels(framebuffer);
+        framebuffer_clear_reset(framebuffer);
         framebuffer->pending = 0;
         framebuffer->pending_top = framebuffer->pending_bottom = 0;
         framebuffer->unpublished = 1;
         framebuffer_rows_add(&framebuffer->unpublished_top, &framebuffer->unpublished_bottom, 0, framebuffer->height);
-        if (cleared) cleared->host_current = 0;
+        if (resident) resident->host_current = 0;
         return 0;
     }
-    if (!framebuffer->pending) return 0;
-    if (!framebuffer->resource_id || g_dev.lost || g_dev.fd < 0) return -1;
-    struct resource *color = res_slot(framebuffer->resource_id);
-    if (!color || color->width != framebuffer->width || color->height != framebuffer->height ||
-        color->size != framebuffer->size) return -1;
-    uint32_t first = framebuffer->pending_top, end = framebuffer->pending_bottom;
-    if (first >= end || end > framebuffer->height) {
-        first = 0;
-        end = framebuffer->height;
+    if (framebuffer->pending) {
+        if (!framebuffer->resource_id || g_dev.lost || g_dev.fd < 0) return -1;
+        struct resource *color = res_slot(framebuffer->resource_id);
+        if (!color || color->width != framebuffer->width || color->height != framebuffer->height ||
+            color->size != framebuffer->size) return -1;
+        uint32_t first = framebuffer->pending_top, end = framebuffer->pending_bottom;
+        if (first >= end || end > framebuffer->height) {
+            first = 0;
+            end = framebuffer->height;
+        }
+        int native = g_dev.native_active;
+        g_dev.native_active = 1;
+        int result = readback_range(color, first, end);
+        g_dev.native_active = native;
+        if (result) {
+            framebuffer->error = 1;
+            color->host_current = 0;
+            return result;
+        }
+        color->host_current = 1;
+        size_t row = (size_t)framebuffer->width * framebuffer->pixel_bytes;
+        memcpy(framebuffer->pixels + first * row, color->bytes + first * row, (end - first) * row);
+        framebuffer_rows_add(&framebuffer->unpublished_top, &framebuffer->unpublished_bottom, first, end);
+        framebuffer->pending = 0;
+        framebuffer->pending_top = framebuffer->pending_bottom = 0;
     }
-    int native = g_dev.native_active;
-    g_dev.native_active = 1;
-    int result = readback_range(color, first, end);
-    g_dev.native_active = native;
-    if (result) {
-        framebuffer->error = 1;
-        color->host_current = 0;
-        return result;
+    if (framebuffer->clear_pending) {
+        fill_pixels(framebuffer);
+        framebuffer_clear_reset(framebuffer);
+        framebuffer->unpublished = 1;
+        framebuffer_rows_add(&framebuffer->unpublished_top, &framebuffer->unpublished_bottom, 0, framebuffer->height);
+        if (resident) resident->host_current = 0;
     }
-    color->host_current = 1;
-    size_t row = (size_t)framebuffer->width * framebuffer->pixel_bytes;
-    memcpy(framebuffer->pixels + first * row, color->bytes + first * row, (end - first) * row);
-    framebuffer_rows_add(&framebuffer->unpublished_top, &framebuffer->unpublished_bottom, first, end);
-    framebuffer->pending = 0;
-    framebuffer->pending_top = framebuffer->pending_bottom = 0;
     return 0;
 }
 
@@ -2085,7 +2212,10 @@ static int framebuffer_evict_unlocked(struct mxgpu_framebuffer *preserve)
         if (candidate && candidate != preserve && !framebuffer_sample_pinned(candidate) && (!victim || candidate->used < victim->used))
             victim = candidate;
     }
-    return victim ? framebuffer_release_resource_unlocked(victim) : -1;
+    const char *reason = mxgpu_readback_reason("evict");
+    int result = victim ? framebuffer_release_resource_unlocked(victim) : -1;
+    mxgpu_readback_reason(reason);
+    return result;
 }
 
 static int framebuffer_trim_bytes_unlocked(struct mxgpu_framebuffer *preserve)
@@ -2101,7 +2231,10 @@ static int framebuffer_trim_bytes_unlocked(struct mxgpu_framebuffer *preserve)
                 victim = candidate;
         }
         if (retained <= MXGPU_FRAMEBUFFER_CACHE_BYTES || !victim) return 0;
-        if (framebuffer_release_resource_unlocked(victim)) return -1;
+        const char *reason = mxgpu_readback_reason("evict-bytes");
+        int released = framebuffer_release_resource_unlocked(victim);
+        mxgpu_readback_reason(reason);
+        if (released) return -1;
     }
     return 0;
 }
@@ -2222,7 +2355,7 @@ int mxgpu_framebuffer_discard(struct mxgpu_framebuffer *framebuffer)
         framebuffer->valid = 0;
         framebuffer->pending = 0;
         framebuffer->unpublished = 0;
-        framebuffer->clear_pending = 0;
+        framebuffer_clear_reset(framebuffer);
         framebuffer->pending_top = framebuffer->pending_bottom = 0;
         framebuffer->unpublished_top = framebuffer->unpublished_bottom = 0;
         if (resource) resource->host_current = 0;
@@ -2290,8 +2423,59 @@ int mxgpu_framebuffer_clear(struct mxgpu_framebuffer *framebuffer, const unsigne
         framebuffer->pending_top = framebuffer->pending_bottom = 0;
         framebuffer->unpublished = 1;
         framebuffer->clear_pending = 1;
-        memcpy(framebuffer->clear_bytes, rgba, sizeof framebuffer->clear_bytes);
+        memcpy(framebuffer->clear_bytes, rgba, 4);
+        memset(framebuffer->clear_mask, 0xff, 4);
         if (resource) resource->host_current = 0;
+    }
+    pthread_mutex_unlock(&g_device_mutex);
+    return result;
+}
+
+int mxgpu_depth_framebuffer_clear(struct mxgpu_framebuffer *framebuffer, int clear_depth, uint32_t depth_bits,
+                                  int clear_stencil, uint32_t stencil, const unsigned char wire[8], uint64_t cpu_revision)
+{
+    pthread_mutex_lock(&g_device_mutex);
+    struct resource *resource = framebuffer && framebuffer->resource_id ?
+        res_slot(framebuffer->resource_id) : NULL;
+    float depth;
+    memcpy(&depth, &depth_bits, sizeof depth);
+    int stencil_format = framebuffer && framebuffer->format != MXGPU_FMT_DEPTH32_FLOAT;
+    int result = !framebuffer || !wire || framebuffer->format == MXGPU_FMT_RGBA8_UNORM || g_dev.lost ||
+        framebuffer->error || framebuffer->resource_blocked || (!clear_depth && !clear_stencil) ||
+        (clear_stencil && !stencil_format) || stencil > 255 || !isfinite(depth) ||
+        (!(clear_depth && (clear_stencil || !stencil_format)) && !framebuffer->valid) ||
+        (framebuffer->resource_id && (!resource || resource->width != framebuffer->width ||
+         resource->height != framebuffer->height || resource->size != framebuffer->size)) ? -1 : 0;
+    if (!result) {
+        unsigned depth_bytes = framebuffer->format == MXGPU_FMT_DEPTH24_UNORM_STENCIL8 ? 3u : 4u;
+        unsigned stencil_byte = framebuffer->format == MXGPU_FMT_DEPTH32_FLOAT_STENCIL8 ? 4u : 3u;
+        for (unsigned byte = 0; byte < depth_bytes && clear_depth; byte++) {
+            framebuffer->clear_bytes[byte] = wire[byte];
+            framebuffer->clear_mask[byte] = 0xff;
+        }
+        if (clear_stencil) {
+            framebuffer->clear_bytes[stencil_byte] = wire[stencil_byte];
+            framebuffer->clear_mask[stencil_byte] = 0xff;
+        }
+        for (unsigned byte = stencil_byte + 1u; byte < framebuffer->pixel_bytes; byte++)
+            framebuffer->clear_bytes[byte] = wire[byte];
+        if (clear_depth) {
+            framebuffer->depth_load_clear = 1;
+            framebuffer->depth_clear_bits = depth_bits;
+        }
+        if (clear_stencil) {
+            framebuffer->stencil_load_clear = 1;
+            framebuffer->stencil_clear_value = stencil;
+        }
+        if (framebuffer_clear_whole(framebuffer)) {
+            framebuffer->pending = 0;
+            framebuffer->pending_top = framebuffer->pending_bottom = 0;
+            if (resource) resource->host_current = 0;
+        }
+        framebuffer->valid = 1;
+        framebuffer->cpu_revision = cpu_revision;
+        framebuffer->unpublished = 1;
+        framebuffer->clear_pending = 1;
     }
     pthread_mutex_unlock(&g_device_mutex);
     return result;
@@ -2301,7 +2485,9 @@ int mxgpu_framebuffer_destroy(struct mxgpu_framebuffer *framebuffer)
 {
     if (!framebuffer) return 0;
     pthread_mutex_lock(&g_device_mutex);
+    const char *reason = mxgpu_readback_reason("framebuffer-destroy");
     int result = framebuffer_release_resource_unlocked(framebuffer);
+    mxgpu_readback_reason(reason);
     if (g_dev.framebuffer == framebuffer) {
         g_dev.framebuffer = NULL;
         g_dev.color_id = g_dev.immediate_color_id;
@@ -2681,12 +2867,19 @@ static int uniform_cache_trim_unlocked(unsigned preserve, uint32_t replacement_s
     return 0;
 }
 
+static unsigned uniform_cache_capacity(void)
+{
+    unsigned commands = g_dev.batch_limits.max_commands;
+    return commands < MXGPU_UNIFORM_CACHE_MINIMUM ? MXGPU_UNIFORM_CACHE_MINIMUM :
+           commands > MXGPU_UNIFORM_CACHE_ENTRIES ? MXGPU_UNIFORM_CACHE_ENTRIES : commands;
+}
+
 static unsigned uniform_cache_acquire_unlocked(unsigned stage, const void *data, uint32_t size)
 {
     struct uniform_cache_entry *entry = NULL, *victim = NULL, *retry = NULL, *compatible = NULL;
     if (g_dev.lost || stage >= 2 || !data || !size) return 0;
     if (g_dev.fd >= 0 && (query_adapter_unlocked() || size > g_dev.adapter_info.max_buffer_bytes)) return 0;
-    for (unsigned i = 0; i < MXGPU_UNIFORM_CACHE_ENTRIES; i++) {
+    for (unsigned i = 0, capacity = uniform_cache_capacity(); i < capacity; i++) {
         struct uniform_cache_entry *candidate = &g_dev.uniform_cache[stage][i];
         struct resource *resource = res_slot(candidate->resource_id);
         if (resource && !candidate->blocked && candidate->logical_size == size &&
@@ -2747,6 +2940,8 @@ static int draw_scene(void)
         g_dev.framebuffer->clear_pending && g_dev.framebuffer->resource_id == g_dev.color_id ?
         g_dev.framebuffer : NULL;
     unsigned depth_target = g_dev.depth_framebuffer ? g_dev.depth_framebuffer->resource_id : g_dev.depth_id;
+    struct mxgpu_framebuffer *depth_clear = g_dev.native_active && g_dev.native_state.depth_enabled &&
+        g_dev.depth_framebuffer && g_dev.depth_framebuffer->clear_pending ? g_dev.depth_framebuffer : NULL;
     if (ensure_pipeline() != 0)
         return -1;
     if (create_buffer_resource(g_dev.vertex_id) != 0)
@@ -2832,6 +3027,14 @@ static int draw_scene(void)
             extended.stencil_load_action = MXGPU_LOAD_LOAD;
             extended.stencil_store_action = MXGPU_STORE_STORE;
             extended.stencil_reference = g_dev.native_state.stencil_reference;
+            if (depth_clear && depth_clear->depth_load_clear) {
+                extended.depth_load_action = MXGPU_LOAD_CLEAR;
+                extended.depth_clear_value = depth_clear->depth_clear_bits;
+            }
+            if (depth_clear && depth_clear->stencil_load_clear) {
+                extended.stencil_load_action = MXGPU_LOAD_CLEAR;
+                extended.stencil_clear_value = depth_clear->stencil_clear_value;
+            }
         }
         extended.color_target_count = 1;
         extended.color_targets[0].resource_id = submit.color_target_id;
@@ -2859,7 +3062,7 @@ static int draw_scene(void)
     } else if (mxgpu_render_submit_encode(&submit, bindings, payload, sizeof payload, &n) != MX_OK)
         return -1;
     if (g_dev.native_active && g_dev.native_state.depth_enabled &&
-        (!g_dev.depth_framebuffer || mxgpu_depth_stencil_writes(&g_dev.native_state.depth_stencil))) {
+        (!g_dev.depth_framebuffer || depth_clear || mxgpu_depth_stencil_writes(&g_dev.native_state.depth_stencil))) {
         g_dev.resources[depth_target].host_current = 0;
         g_dev.resources[depth_target].upload_scheduled = 0;
     }
@@ -2875,12 +3078,20 @@ static int draw_scene(void)
     }
     g_needs_clear = 0;
     if (clear_target) {
-        clear_target->clear_pending = 0;
+        framebuffer_clear_reset(clear_target);
         framebuffer_rows_add(&clear_target->pending_top, &clear_target->pending_bottom, 0, clear_target->height);
+    }
+    if (depth_clear) {
+        framebuffer_clear_reset(depth_clear);
+        framebuffer_rows_add(&depth_clear->pending_top, &depth_clear->pending_bottom, 0, depth_clear->height);
+        depth_clear->pending = depth_clear->unpublished = 1;
     }
     g_readback_done = 0;
     if (!g_dev.deferred_readback && g_dev.fd >= 0 && (unsigned long)g_rt_w * g_rt_h * 4u <= readback_limit()) {
-        if (readback_color() != 0)
+        const char *reason = mxgpu_readback_reason("draw-immediate");
+        int read = readback_color();
+        mxgpu_readback_reason(reason);
+        if (read != 0)
             return -1;
         g_readback_done = 1;
     }
@@ -3269,7 +3480,10 @@ static int mxgpu_execute_module_uniforms_unlocked(const uint8_t *module, uint32_
                     source->used = ++g_dev.framebuffer_clock;
                     continue;
                 }
-                if (framebuffer_sync_unlocked(source)) return -1;
+                const char *reason = mxgpu_readback_reason("sample-fallback");
+                int synced = framebuffer_sync_unlocked(source);
+                mxgpu_readback_reason(reason);
+                if (synced) return -1;
                 fallback = *input;
                 fallback.framebuffer = NULL;
                 fallback.pixels = source->pixels;
@@ -3300,7 +3514,10 @@ static int mxgpu_execute_module_uniforms_unlocked(const uint8_t *module, uint32_
     if (!dst || !dst->bytes || dst->width != (unsigned)cw || dst->height != (unsigned)ch)
         return -1;
     if (!g_dev.deferred_readback && !g_readback_done && g_dev.fd >= 0) {
-        if (readback_color() != 0)
+        const char *reason = mxgpu_readback_reason("draw-immediate");
+        int read = readback_color();
+        mxgpu_readback_reason(reason);
+        if (read != 0)
             return -1;
         g_readback_done = 1;
     }
@@ -3496,6 +3713,8 @@ static void mxgpu_device_close_unlocked(void)
     private_context_release();
     for (i = 0; i < MXGPU_RESOURCE_SLOTS; i++)
         free(g_dev.resources[i].bytes);
+    for (i = 0; i < 16; i++)
+        free(g_dev.shaders[i].bytes);
     if (g_dev.fd >= 0)
         close(g_dev.fd);
     free(g_dev.command_scratch.bytes);
@@ -3817,6 +4036,7 @@ static int execute_module_transaction_resources(int fd, const uint8_t *module, u
                 depth_framebuffer->cpu_revision = state->depth.cpu_revision;
                 depth_framebuffer->valid = 1;
                 depth_framebuffer->pending = depth_framebuffer->error = depth_framebuffer->unpublished = 0;
+                framebuffer_clear_reset(depth_framebuffer);
                 depth_framebuffer->pending_top = depth_framebuffer->pending_bottom = 0;
                 depth_framebuffer->unpublished_top = depth_framebuffer->unpublished_bottom = 0;
                 reseed = 1;
@@ -3825,12 +4045,13 @@ static int execute_module_transaction_resources(int fd, const uint8_t *module, u
         if (!result) result = framebuffer_resource_reserve_unlocked(depth_framebuffer);
         struct resource *depth = result ? NULL : res_slot(depth_framebuffer->resource_id);
         if (!result && !depth) result = -1;
-        if (!result && (reseed || !depth->host_live || (!depth_framebuffer->pending && !depth->host_current)))
+        int load_clear = depth_framebuffer->clear_pending && framebuffer_clear_whole(depth_framebuffer);
+        if (!result && !load_clear && (reseed || !depth->host_live || (!depth_framebuffer->pending && !depth->host_current)))
             result = replace_bytes(depth_framebuffer->resource_id, depth_framebuffer->pixels, depth_framebuffer->size,
                                    depth_framebuffer->width, depth_framebuffer->height);
         if (!result) result = create_texture_resource(depth_framebuffer->resource_id,
             MXGPU_USAGE_DEPTH_STENCIL | MXGPU_USAGE_TRANSFER_SOURCE | MXGPU_USAGE_TRANSFER_DESTINATION);
-        if (!result && !depth_framebuffer->pending) result = transfer_bytes(depth_framebuffer->resource_id);
+        if (!result && !depth_framebuffer->pending && !load_clear) result = transfer_bytes(depth_framebuffer->resource_id);
     }
     struct resource *framebuffer_resource = framebuffer ? res_slot(framebuffer->resource_id) : NULL;
     int framebuffer_needs_seed = framebuffer && (!framebuffer->resource_id || framebuffer->resource_blocked ||
@@ -3847,7 +4068,7 @@ static int execute_module_transaction_resources(int fd, const uint8_t *module, u
                 framebuffer->cpu_revision = cpu_revision;
                 framebuffer->valid = 1;
                 framebuffer->pending = framebuffer->error = framebuffer->unpublished = 0;
-                framebuffer->clear_pending = 0;
+                framebuffer_clear_reset(framebuffer);
                 framebuffer->pending_top = framebuffer->pending_bottom = 0;
                 framebuffer->unpublished_top = framebuffer->unpublished_bottom = 0;
             }
@@ -3887,7 +4108,8 @@ static int execute_module_transaction_resources(int fd, const uint8_t *module, u
     }
     if (!result) {
         operation = "module-execute";
-        g_dev.batch_collect = framebuffer && state && !state->depth_enabled &&
+        g_dev.batch_collect = framebuffer && state &&
+                              (!state->depth_enabled || (depth_framebuffer && !g_dev.depth_batch_unsupported)) &&
                               g_dev.fd >= 0 && g_dev.batch_limits.max_commands;
         result = mxgpu_execute_module_uniforms_unlocked(module, module_len, vertices, vertex_count,
                                                        texels, tw, th, color, cw, ch,
@@ -3901,7 +4123,9 @@ static int execute_module_transaction_resources(int fd, const uint8_t *module, u
     if (!result && state && state->depth_enabled && !depth_framebuffer) {
         struct resource *depth = res_slot(g_dev.depth_id);
         operation = "depth-readback";
+        const char *reason = mxgpu_readback_reason("draw-depth-immediate");
         result = readback_attachment(depth);
+        mxgpu_readback_reason(reason);
         if (!result) {
             depth->host_current = 1;
             memcpy(state->depth.pixels, depth->bytes, depth->size);

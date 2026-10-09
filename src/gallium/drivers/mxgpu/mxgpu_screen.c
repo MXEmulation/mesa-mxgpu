@@ -140,6 +140,7 @@ struct mxgpu_context {
     struct pipe_stencil_ref stencil_ref;
     unsigned draw_instance, draw_base_instance;
     int draw_base_vertex;
+    uint8_t *module;
 };
 
 static struct mxgpu_resource *res_of(struct pipe_resource *resource)
@@ -260,8 +261,10 @@ static void mxgpu_resource_destroy(struct pipe_screen *screen, struct pipe_resou
     struct mxgpu_screen *mx = screen_of(screen);
     struct mxgpu_resource **link = &mx->resources;
     struct mxgpu_resource *peer;
+    const char *reason = mxgpu_readback_reason("resource-destroy");
     resource_publish(res);
     mxgpu_framebuffer_destroy(res->framebuffer);
+    mxgpu_readback_reason(reason);
     free(res->framebuffer_pixels);
     simple_mtx_lock(&mx->resource_mutex);
     while (*link && *link != res)
@@ -306,7 +309,10 @@ static bool mxgpu_get_handle(struct pipe_screen *screen, struct pipe_context *co
     struct mxgpu_screen *mx = screen_of(screen);
     (void)context;
     (void)usage;
-    if (mxgpu_device_flush() || !resource_publish(res))
+    const char *reason = mxgpu_readback_reason("get-handle");
+    bool published = !mxgpu_device_flush() && resource_publish(res);
+    mxgpu_readback_reason(reason);
+    if (!published)
         return false;
     res->cpu_revision++;
     if (!res->gem || !handle || mx->fd < 0 || handle->plane || handle->layer)
@@ -626,7 +632,10 @@ static void *map_resource(struct pipe_context *pipe, struct pipe_resource *resou
     xfer = CALLOC_STRUCT(pipe_transfer);
     if (!xfer)
         return NULL;
-    if (!resource_cpu_sync(res, usage, false)) {
+    const char *reason = mxgpu_readback_reason("map");
+    bool synced = resource_cpu_sync(res, usage, false);
+    mxgpu_readback_reason(reason);
+    if (!synced) {
         FREE(xfer);
         return NULL;
     }
@@ -1138,7 +1147,10 @@ static bool copy_constant_bytes(struct mxgpu_context *ctx, unsigned stage, unsig
     if (!constant_data(ctx, stage, index, &data, &size) || bytes > size || (bytes && !data))
         return false;
     struct pipe_resource *buffer = ctx->constants[stage][index].buffer;
-    if (buffer && !resource_cpu_sync(res_of(buffer), PIPE_MAP_READ, false))
+    const char *reason = mxgpu_readback_reason("constants");
+    bool synced = !buffer || resource_cpu_sync(res_of(buffer), PIPE_MAP_READ, false);
+    mxgpu_readback_reason(reason);
+    if (!synced)
         return false;
     if (bytes)
         memcpy(destination, data, bytes);
@@ -1507,7 +1519,9 @@ static void mxgpu_flush(struct pipe_context *pipe, struct pipe_fence_handle **fe
     struct mxgpu_pending **link = &ctx->pending;
     bool success = true;
     (void)flags;
+    const char *reason = mxgpu_readback_reason("flush-publish");
     if (mxgpu_device_flush()) {
+        mxgpu_readback_reason(reason);
         if (fence)
             *fence = NULL;
         return;
@@ -1527,6 +1541,7 @@ static void mxgpu_flush(struct pipe_context *pipe, struct pipe_fence_handle **fe
         pipe_resource_reference(&entry->resource, NULL);
         FREE(entry);
     }
+    mxgpu_readback_reason(reason);
     if (fence)
         *fence = success ? signaled_fence() : NULL;
 }
@@ -1684,7 +1699,10 @@ static bool read_texture_slice(struct pipe_sampler_view *view, unsigned level, u
         free(stripe);
         return false;
     }
-    if (!resource_cpu_sync(res, PIPE_MAP_READ, false)) {
+    const char *reason = mxgpu_readback_reason("sample-cpu");
+    bool synced = resource_cpu_sync(res, PIPE_MAP_READ, false);
+    mxgpu_readback_reason(reason);
+    if (!synced) {
         free(dst);
         free(stripe);
         return false;
@@ -2361,16 +2379,23 @@ static void mxgpu_blit(struct pipe_context *pipe, const struct pipe_blit_info *i
         return;
     src = res_of(info->src.resource);
     dst = res_of(info->dst.resource);
+    const char *reason = mxgpu_readback_reason("blit");
     if (src == dst) {
-        if (!resource_cpu_sync(src, PIPE_MAP_READ | PIPE_MAP_WRITE, false))
+        bool synced = resource_cpu_sync(src, PIPE_MAP_READ | PIPE_MAP_WRITE, false);
+        mxgpu_readback_reason(reason);
+        if (!synced)
             return;
         mxgpu_blit_cpu(pipe, info);
         resource_cpu_sync(src, PIPE_MAP_READ | PIPE_MAP_WRITE, true);
         return;
     }
-    if (!resource_cpu_sync(src, PIPE_MAP_READ, false))
+    bool synced = resource_cpu_sync(src, PIPE_MAP_READ, false);
+    mxgpu_readback_reason(synced ? "blit-destination" : reason);
+    if (!synced)
         return;
-    if (!resource_cpu_sync(dst, PIPE_MAP_READ | PIPE_MAP_WRITE, false)) {
+    synced = resource_cpu_sync(dst, PIPE_MAP_READ | PIPE_MAP_WRITE, false);
+    mxgpu_readback_reason(reason);
+    if (!synced) {
         resource_cpu_sync(src, PIPE_MAP_READ, true);
         return;
     }
@@ -2510,8 +2535,10 @@ static void barrier_nop(struct pipe_context *pipe, unsigned flags)
 static void resource_nop(struct pipe_context *pipe, struct pipe_resource *resource)
 {
     (void)pipe;
+    const char *reason = mxgpu_readback_reason("flush-resource");
     if (!mxgpu_device_flush() && resource && resource_publish(res_of(resource)))
         res_of(resource)->cpu_revision++;
+    mxgpu_readback_reason(reason);
 }
 
 static void invalidate_resource(struct pipe_context *pipe, struct pipe_resource *resource)
@@ -2706,7 +2733,7 @@ static float *gather_restart_triangles(struct mxgpu_context *ctx, const unsigned
     return result;
 }
 
-static void mxgpu_draw(struct pipe_context *pipe, const struct pipe_draw_info *info, unsigned drawid_offset, const struct pipe_draw_indirect_info *indirect, const struct pipe_draw_start_count_bias *draws, unsigned num_draws)
+static void mxgpu_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info, unsigned drawid_offset, const struct pipe_draw_indirect_info *indirect, const struct pipe_draw_start_count_bias *draws, unsigned num_draws)
 {
     struct mxgpu_context *ctx = ctx_of(pipe);
     unsigned char *texels = NULL;
@@ -2760,6 +2787,8 @@ static void mxgpu_draw(struct pipe_context *pipe, const struct pipe_draw_info *i
     ch = ctx->fb.height;
     if (cw == 0 || ch == 0 || cw > 2048 || ch > 2048)
         return;
+    if (!ctx->module && !(ctx->module = MALLOC(MXGPU_LINK_MODULE_CAPACITY)))
+        return;
     if (ctx->scissor_enabled &&
         (ctx->scissor.minx >= MIN2(ctx->scissor.maxx, cw) ||
          ctx->scissor.miny >= MIN2(ctx->scissor.maxy, ch)))
@@ -2803,7 +2832,10 @@ static void mxgpu_draw(struct pipe_context *pipe, const struct pipe_draw_info *i
             depth_pixels = malloc((size_t)cw * ch * block);
             if (!depth_pixels)
                 return;
-            if (!depth_rows_copy(&ctx->fb.zsbuf, depth_pixels, cw, ch, false))
+            mxgpu_readback_reason("draw-depth-copy");
+            bool copied = depth_rows_copy(&ctx->fb.zsbuf, depth_pixels, cw, ch, false);
+            mxgpu_readback_reason("draw");
+            if (!copied)
                 goto free_textures;
         }
         native_state.depth.framebuffer = depth_target ? depth_target->framebuffer : NULL;
@@ -2903,6 +2935,7 @@ static void mxgpu_draw(struct pipe_context *pipe, const struct pipe_draw_info *i
     }
     if (!has_color)
         memset(pixels, 0, (size_t)cw * ch * 4u);
+    mxgpu_readback_reason("draw-target");
     bool load_clear = deferred && target->clear_pending &&
         !mxgpu_framebuffer_clear(target->framebuffer, target->clear_rgba, target->cpu_revision);
     if (deferred && target->clear_pending && !load_clear && !resource_publish(target))
@@ -2921,6 +2954,7 @@ static void mxgpu_draw(struct pipe_context *pipe, const struct pipe_draw_info *i
         if (!deferred) free(pixels);
         goto free_textures;
     }
+    mxgpu_readback_reason("draw");
     if (!native && (ctx->scissor_enabled || source_over || color_mask != 15u)) {
         preserved = malloc((size_t)cw * ch * 4u);
         if (!preserved) {
@@ -2932,7 +2966,7 @@ static void mxgpu_draw(struct pipe_context *pipe, const struct pipe_draw_info *i
     for (ctx->draw_instance = 0; ctx->draw_instance < info->instance_count; ctx->draw_instance++) {
     for (draw = 0; draw < num_draws; draw++) {
         ctx->draw_base_vertex = info->index_size ? draws[draw].index_bias : draws[draw].start;
-        uint8_t module[MXGPU_LINK_MODULE_CAPACITY];
+        uint8_t *module = ctx->module;
         uint32_t module_len = 0;
         unsigned count = draws[draw].count;
         unsigned *indices = NULL;
@@ -2970,7 +3004,7 @@ static void mxgpu_draw(struct pipe_context *pipe, const struct pipe_draw_info *i
         }
         if (!verts)
             continue;
-        if (mxgpu_link_shaders_draw_samplers(vs, ctx->fs, count, bound_sampler, module, sizeof module, &module_len, sampler_compare) != 0) {
+        if (mxgpu_link_shaders_draw_samplers(vs, ctx->fs, count, bound_sampler, module, MXGPU_LINK_MODULE_CAPACITY, &module_len, sampler_compare) != 0) {
             static int link_noted;
             if (!link_noted) {
                 fprintf(stderr, "mxgpu link failed vs %u fs %u\n", ctx->vs ? ctx->vs->count : 0, ctx->fs ? fs->count : 0);
@@ -3055,6 +3089,64 @@ free_textures:
         free(texels);
 }
 
+static void mxgpu_draw(struct pipe_context *pipe, const struct pipe_draw_info *info, unsigned drawid_offset, const struct pipe_draw_indirect_info *indirect, const struct pipe_draw_start_count_bias *draws, unsigned num_draws)
+{
+    const char *reason = mxgpu_readback_reason("draw");
+    mxgpu_draw_vbo(pipe, info, drawid_offset, indirect, draws, num_draws);
+    mxgpu_readback_reason(reason);
+}
+
+static bool depth_clear_deferred(struct mxgpu_context *ctx, struct pipe_surface *surf, unsigned buffers,
+                                 uint8_t stencil_mask, unsigned minx, unsigned miny, unsigned maxx,
+                                 unsigned maxy, double depth, unsigned stencil)
+{
+    struct pipe_resource *zs = surf->texture;
+    struct mxgpu_resource *res = res_of(zs);
+    const struct util_format_pack_description *pack = util_format_pack_description(surf->format);
+    unsigned format = native_depth_format(surf->format);
+    bool has_stencil = util_format_has_stencil(util_format_description(surf->format));
+    bool clear_depth = buffers & PIPE_CLEAR_DEPTH;
+    bool clear_stencil = has_stencil ? (buffers & PIPE_CLEAR_STENCIL) && stencil_mask :
+                         clear_depth && format != MXGPU_FMT_DEPTH32_FLOAT;
+    if (!format || !pack || zs->target != PIPE_TEXTURE_2D || zs->array_size > 1 || surf->level ||
+        surf->first_layer || surf->last_layer || surf->format != zs->format || res->imported ||
+        res->external || minx || miny || maxx != zs->width0 || maxy != zs->height0 ||
+        (!clear_depth && !clear_stencil) || (has_stencil && clear_stencil && stencil_mask != 255u) ||
+        (clear_depth && !pack->pack_z_float) || (has_stencil && clear_stencil && !pack->pack_s_8uint) ||
+        !color_rows_fit(res, 0, zs->width0, zs->height0, util_format_get_blocksize(zs->format)) ||
+        !mxgpu_native_depth_available(screen_of(ctx->base.screen)->fd, format))
+        return false;
+    bool whole = clear_depth && (clear_stencil || format == MXGPU_FMT_DEPTH32_FLOAT);
+    if (!whole && (!res->framebuffer || !mxgpu_framebuffer_current(res->framebuffer, res->cpu_revision)))
+        return false;
+    if (!res->framebuffer)
+        res->framebuffer = mxgpu_depth_framebuffer_create(zs->width0, zs->height0, format);
+    if (!res->framebuffer)
+        return false;
+    unsigned char packed[16] = {0}, wire[8] = {0};
+    float value = (float)depth;
+    uint8_t stencil_value = (uint8_t)stencil;
+    if (clear_depth)
+        util_format_pack_z_float(surf->format, packed, &value, 1);
+    if (has_stencil && clear_stencil)
+        util_format_pack_s_8uint(surf->format, packed, &stencil_value, 1);
+    depth_row_to_wire(wire, packed, 1, surf->format);
+    uint32_t bits;
+    if (format == MXGPU_FMT_DEPTH24_UNORM_STENCIL8) {
+        uint32_t word;
+        memcpy(&word, wire, sizeof word);
+        value = (float)(word & 0xffffffu) / 16777215.0f;
+        bits = float_bits(value);
+    } else
+        memcpy(&bits, wire, sizeof bits);
+    if (mxgpu_depth_framebuffer_clear(res->framebuffer, clear_depth, clear_depth ? bits : 0, clear_stencil,
+                                      has_stencil && clear_stencil ? stencil_value : 0, wire, res->cpu_revision + 1))
+        return false;
+    res->cpu_revision++;
+    res->framebuffer_dirty = true;
+    return true;
+}
+
 static void mxgpu_clear_depth_stencil(struct mxgpu_context *ctx, unsigned buffers,
                                       uint8_t stencil_mask, const struct pipe_scissor_state *scissor,
                                       double depth, unsigned stencil)
@@ -3077,10 +3169,15 @@ static void mxgpu_clear_depth_stencil(struct mxgpu_context *ctx, unsigned buffer
         maxx = MIN2(scissor->maxx, maxx);
         maxy = MIN2(scissor->maxy, maxy);
     }
+    if (depth_clear_deferred(ctx, surf, buffers, stencil_mask, minx, miny, maxx, maxy, depth, stencil))
+        return;
     block = util_format_get_blocksize(surf->format);
     for (i = 0; i < 1024; i++)
         depth_row[i] = (float)depth;
-    if (!resource_cpu_sync(res, PIPE_MAP_READ | PIPE_MAP_WRITE, false))
+    const char *reason = mxgpu_readback_reason("clear-zs");
+    bool synced = resource_cpu_sync(res, PIPE_MAP_READ | PIPE_MAP_WRITE, false);
+    mxgpu_readback_reason(reason);
+    if (!synced)
         return;
     for (y = miny; y < maxy; y++) {
         for (x = minx; x < maxx; x += 1024) {
@@ -3160,7 +3257,10 @@ static void mxgpu_clear(struct pipe_context *pipe, unsigned buffers, uint32_t co
             res->cpu_revision++;
             continue;
         }
-        if (!resource_cpu_sync(res, PIPE_MAP_READ | PIPE_MAP_WRITE, false))
+        const char *reason = mxgpu_readback_reason("clear-color");
+        bool synced = resource_cpu_sync(res, PIPE_MAP_READ | PIPE_MAP_WRITE, false);
+        mxgpu_readback_reason(reason);
+        if (!synced)
             continue;
         if (fast) {
             color_fill_rows(res, surf->level, minx, miny, maxx, maxy, packed, keep);
@@ -3214,6 +3314,7 @@ static void mxgpu_destroy_context(struct pipe_context *pipe)
     util_unreference_framebuffer_state(&ctx->fb);
     for (i = 0; i < MXGPU_SHADER_TEXTURES; i++)
         pipe_sampler_view_reference(&ctx->views[i], NULL);
+    FREE(ctx->module);
     FREE(ctx);
 }
 

@@ -35,6 +35,7 @@ int mxgpu_debug_illegal_then_legal(void);
 int mxgpu_device_available(void);
 int mxgpu_device_lost(void);
 int mxgpu_device_flush(void);
+const char *mxgpu_readback_reason(const char *reason);
 unsigned mxgpu_last_submits(void);
 
 int mxgpu_readback_ready(void);
@@ -115,6 +116,8 @@ int mxgpu_framebuffer_current(struct mxgpu_framebuffer *framebuffer, uint64_t cp
 int mxgpu_framebuffer_destroy(struct mxgpu_framebuffer *framebuffer);
 int mxgpu_framebuffer_discard(struct mxgpu_framebuffer *framebuffer);
 int mxgpu_framebuffer_clear(struct mxgpu_framebuffer *framebuffer, const unsigned char rgba[4], uint64_t cpu_revision);
+int mxgpu_depth_framebuffer_clear(struct mxgpu_framebuffer *framebuffer, int clear_depth, uint32_t depth_bits,
+                                  int clear_stencil, uint32_t stencil, const unsigned char wire[8], uint64_t cpu_revision);
 typedef void (*mxgpu_row_convert)(unsigned char *destination, const unsigned char *source, unsigned width, unsigned arg);
 int mxgpu_framebuffer_sync(struct mxgpu_framebuffer *framebuffer, unsigned char *destination,
                            uint32_t destination_stride, mxgpu_row_convert convert, unsigned convert_arg,
